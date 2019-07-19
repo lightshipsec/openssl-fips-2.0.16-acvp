@@ -67,6 +67,8 @@
 #include <openssl/err.h>
 #include <openssl/bn.h>
 
+#include "acvp.h"
+
 #ifndef OPENSSL_FIPS
 
 int main(int argc, char *argv[])
@@ -80,7 +82,8 @@ int main(int argc, char *argv[])
 #include <openssl/fips.h>
 #include "fips_utl.h"
 
-static int hmac_test(const EVP_MD *md, FILE *out, FILE *in);
+static int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in);
+static int hmac_test_cavs(const EVP_MD *md, FILE *out, FILE *in);
 static int print_hmac(const EVP_MD *md, FILE *out,
 		unsigned char *Key, int Klen,
 		unsigned char *Msg, int Msglen, int Tlen);
@@ -93,8 +96,14 @@ int main(int argc, char **argv)
 	{
 	FILE *in = NULL, *out = NULL;
 
-	int ret = 1;
+	int ret = 1, res = 0;
 	fips_algtest_init();
+
+    int acvp = 0, cavs = 0;
+    if(select_mode(&cavs, &acvp) != 0)  {
+        printf("Unable to determine if CAVS or ACVP mode selected.\n");
+        return -1;
+    }
 
 	if (argc == 1)
 		in = stdin;
@@ -118,15 +127,21 @@ int main(int argc, char **argv)
 		goto end;
 		}
 
-	if (!hmac_test(EVP_sha1(), out, in))
-		{
+    if (cavs)
+        res = hmac_test_cavs(EVP_sha1(), out, in);
+    else if (acvp)
+        res = hmac_test_acvp(EVP_sha1(), out, in);
+    else
+        printf("Unknown operational mode (CAVS or ACVP required).");
+
+    if (!res)  {
 		fprintf(stderr, "FATAL hmac file processing error\n");
 		goto end;
-		}
+    }
 	else
 		ret = 0;
 
-	end:
+end:
 
 	if (in && (in != stdin))
 		fclose(in);
@@ -139,7 +154,135 @@ int main(int argc, char **argv)
 
 #define HMAC_TEST_MAXLINELEN	1024
 
-int hmac_test(const EVP_MD *md, FILE *out, FILE *in)
+int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
+	unsigned char *Key = NULL, *Msg = NULL;
+	int Count, Klen, Tlen;
+	long Keylen, Msglen;
+	int ret = 0;
+
+    cJSON *json = NULL;
+
+    if ((json = read_fd_as_json(in)) == NULL)  {
+        printf("Cannot parse JSON file\n");
+        goto error_die;
+    }
+
+    /* Check version is correct */
+    if (!verify_acvp_version(json, "1.0"))  {
+        printf("ACVP version number is not expected.");
+        goto error_die;
+    }
+
+
+    /* Vector set */
+    const cJSON *vs = NULL;
+    SAFEGET(get_array_item(&vs, json, 1), "Vector set missing in JSON\n");
+
+    /* Need the algorithm function, the msg and the length */
+    const cJSON *algStr = NULL;
+    SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
+
+    if(!strncmp("HMAC-SHA-1", algStr->valuestring, 8))   /* UNTESTED! */
+        md=EVP_sha1();
+    else if(!strncmp("HMAC-SHA224", algStr->valuestring, 8))
+        md=EVP_sha224();
+    else if (!strncmp("HMAC-SHA256", algStr->valuestring, 8))
+        md=EVP_sha256();
+    else if (!strncmp("HMAC-SHA384", algStr->valuestring, 8))
+        md=EVP_sha384();
+    else if (!strncmp("HMAC-SHA512", algStr->valuestring, 8))
+        md=EVP_sha512();
+    /* TODO: Truncated versions? */
+    else {
+        printf("Unknown message digest algorithm `%s'\n", algStr->valuestring);
+        goto error_die;
+    }
+
+
+    /* For each test group
+     *      For each test case
+     *          Process...
+     */
+    const cJSON *tgs = NULL;
+    SAFEGET(get_object(&tgs, vs, "testGroups"), "Missing 'testGroups' in input JSON\n");
+    const cJSON *tg = NULL;
+    cJSON_ArrayForEach(tg, tgs)  {
+        if(!tg)  {
+            printf("Test groups array is missing test group object.\n");
+            goto error_die;
+        }
+
+        /* Get test group ID */
+        const cJSON *tgId = NULL;
+        SAFEGET(get_integer_object(&tgId, tg, "tgId"), "Missing test group id!\n");
+        /* Get test type */
+        const cJSON *test_type = NULL;
+        SAFEGET(get_string_object(&test_type, tg, "testType"), "Missing `testType' in input JSON\n");
+
+        /* Key length, message length, mac length */
+        const cJSON *keyLen = NULL;
+        SAFEGET(get_integer_object(&keyLen, tg, "keyLen"), "Missing `keyLen' in input JSON\n");
+
+        const cJSON *msgLen = NULL;
+        SAFEGET(get_integer_object(&msgLen, tg, "msgLen"), "Missing `msgLen' in input JSON\n");
+
+        const cJSON *macLen = NULL;
+        SAFEGET(get_integer_object(&macLen, tg, "macLen"), "Missing `macLen' in input JSON\n");
+
+        /* Now iterate over the test cases */
+        const cJSON *tests = NULL;
+        SAFEGET(get_object(&tests, tg, "tests"), "Missing test cases in test group %d\n", tgId->valueint);
+
+        const cJSON *tc = NULL;
+        cJSON_ArrayForEach(tc, tests)  {
+            if(!tc)  {
+                printf("Test groups array is missing test cases.");
+                goto error_die;
+            }
+
+            /* Get test case ID */
+            const cJSON *tcId = NULL;
+            SAFEGET(get_integer_object(&tcId, tc, "tcId"), "Missing test case id in test group %d!\n", tgId->valueint);
+
+            const cJSON *msgStr = NULL;
+            SAFEGET(get_string_object(&msgStr, tc, "msg"), "Missing message in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+            const cJSON *keyStr = NULL;
+            SAFEGET(get_string_object(&keyStr, tc, "key"), "Missing key in test %d in test group %d\n", tcId->valueint, tgId->valueint);
+
+            Msg = hex2bin_m(msgStr->valuestring, &Msglen);
+            Key = hex2bin_m(keyStr->valuestring, &Keylen);
+
+            Tlen = macLen->valueint/8;
+            Klen = keyLen->valueint/8;
+            Msglen = msgLen->valueint;
+
+		    if (Key && Msg && (Tlen > 0) && (Klen > 0))  {
+			    if (!print_hmac(md, out, Key, Klen, Msg, Msglen, Tlen))
+				    goto error_die;
+    			OPENSSL_free(Key);
+	    		Key = NULL;
+		    	OPENSSL_free(Msg);
+			    Msg = NULL;
+			    Klen = -1;
+			    Tlen = -1;
+			}
+        }
+    }
+
+    ret = 1;
+    goto cleanup;
+
+
+error_die:
+    ret = 0;
+
+cleanup:
+    if(json) cJSON_Delete(json); json = NULL;
+
+    return ret;
+}
+
+int hmac_test_cavs(const EVP_MD *md, FILE *out, FILE *in)
 	{
 	char *linebuf, *olinebuf, *p, *q;
 	char *keyword, *value;
