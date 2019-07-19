@@ -1,3 +1,8 @@
+/**
+ * ACVP modifications copyright (c) 2019 Lightship Security.
+ * All rights reserved.
+ */
+
 /* ====================================================================
  * Copyright (c) 2004 The OpenSSL Project.  All rights reserved.
  *
@@ -71,6 +76,9 @@
 
 #include <openssl/err.h>
 #include "e_os.h"
+
+#include "acvp.h"
+
 
 #ifndef OPENSSL_FIPS
 
@@ -548,7 +556,233 @@ static int do_mct(char *amode,
   # Fri Aug 30 04:07:22 PM
   ----------------------------*/
 
-static int proc_file(char *rqfile, char *rspfile)
+static int proc_file_acvp(char *rqfile, char *rspfile)  {
+    int ret = 0;
+    cJSON *json = NULL;
+    char afn[256], rfn[256];
+    FILE *rfp = NULL;
+    char *rp;
+    char amode[8] = "";
+    int dir = -1;
+    int akeysz = 0;
+    unsigned char iVec[20], aKey[40];
+    unsigned char plaintext[2048];
+    unsigned char ciphertext[2048];
+
+    EVP_CIPHER_CTX ctx;
+    FIPS_cipher_ctx_init(&ctx);
+
+    if (!rqfile || !(*rqfile))  {
+	    printf("No req file\n");
+        goto error_die;
+	}
+    strcpy(afn, rqfile);
+
+    if ((json = read_file_as_json(afn)) == NULL)  {
+	    printf("Cannot open file: %s, %s\n", 
+	       afn, strerror(errno));
+        goto error_die;
+	}
+    if (!rspfile)  {
+	    strcpy(rfn,afn);
+    	rp=strstr(rfn,"req/");
+#ifdef OPENSSL_SYS_WIN32
+	    if (!rp)
+	        rp=strstr(rfn,"req\\");
+#endif
+    	assert(rp);
+	    memcpy(rp,"rsp",3);
+    	rp = strstr(rfn, ".req");
+	    memcpy(rp, ".rsp", 4);
+    	rspfile = rfn;
+	}
+    if ((rfp = fopen(rspfile, "w")) == NULL)  {
+	    printf("Cannot open file: %s, %s\n", 
+	       rfn, strerror(errno));
+        goto error_die;
+	}
+
+    /* Data is parsed already; now we need to extract everything to give to the caller. */
+    /* Validate that the structure is sound and conforms with the expected structure format. */
+    if (cJSON_GetArraySize(json) != 2)  {
+        printf("Expecting array of size 2 in top-level JSON. Check input format.\n");
+        goto error_die;
+    }
+
+    /* Check version is correct */
+    const cJSON *a0 = NULL;
+    SAFEGET(get_array_item(&a0, json, 0), "JSON not structured properly\n");
+
+    const cJSON *versionStr = NULL;
+    SAFEGET(get_string_object(&versionStr, a0, "acvVersion"), "Version identifier is missing\n");
+
+    assert(strncmp("1.0", versionStr->valuestring, 3) == 0);
+
+    /* Now get the pertinent details */
+    const cJSON *vs = NULL;
+    SAFEGET(get_array_item(&vs, json, 1), "Vector set missing in JSON\n");
+    const cJSON *algStr = NULL;
+    SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
+    /* Algorithm mode is last 3 chars */
+    strncpy(amode, &algStr->valuestring[strlen(algStr->valuestring)-3], 3);
+    amode[4] = '\x0';
+
+    /* For each test group
+     *      For each test case
+     *          Process...
+     */
+    const cJSON *tgs = NULL;
+    SAFEGET(get_object(&tgs, vs, "testGroups"), "Missing 'testGroups' in input JSON\n");
+    const cJSON *tg = NULL;
+    cJSON_ArrayForEach(tg, tgs)  {
+        if(!tg)  {
+            printf("Test groups array is missing test group object.\n");
+            goto error_die;
+        }
+
+        /* Get test group ID */
+        const cJSON *tgId = NULL;
+        SAFEGET(get_integer_object(&tgId, tg, "tgId"), "Missing test group id!\n");
+
+        /* Get test type (used later) and direction */
+        const cJSON *test_type = NULL;
+        SAFEGET(get_string_object(&test_type, tg, "testType"), "Missing `testType' in input JSON\n");
+        const cJSON *direction = NULL;
+        SAFEGET(get_string_object(&direction, tg, "direction"), "Missing `direction' in input JSON\n");
+        if(strncmp("encrypt", direction->valuestring, 7) == 0)
+            dir = 1;
+        else if (strncmp("decrypt", direction->valuestring, 7) == 0)
+            dir = 0;
+        else  {
+            printf ("Unknown direction %s found\n", direction->valuestring);
+        }
+
+        /* Get key length */
+        const cJSON *keyLen = NULL;
+        SAFEGET(get_integer_object(&keyLen, tg, "keyLen"), "Missing `keyLen' in input JSON\n");
+
+        /* Now iterate over the test cases */
+        const cJSON *tests = NULL;
+        SAFEGET(get_object(&tests, tg, "tests"), "Missing test cases in test group %d\n", tgId->valueint);
+
+        const cJSON *tc = NULL;
+        cJSON_ArrayForEach(tc, tests)  {
+            if(!tc)  {
+                printf("Test groups array is missing test cases.");
+                goto error_die;
+            }
+
+            /* Get test case ID */
+            const cJSON *tcId = NULL;
+            SAFEGET(get_integer_object(&tcId, tc, "tcId"), "Missing test case id in test group %d!\n", tgId->valueint);
+
+            /* Get key and IV */
+            akeysz = keyLen->valueint;
+            
+            cJSON *ivStr = NULL;
+		    memset(iVec, 0, sizeof(iVec));
+            if (strncmp(amode, "ECB", 3) != 0)  {
+                /* ECB has no IV, everything else does */
+                SAFEGET(get_string_object(&ivStr, tc, "iv"), "Missing IV in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                if(hex2bin(ivStr->valuestring, iVec) < 0)  {
+                    printf("IV has invalid length in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                    goto error_die;
+                }
+            }
+
+            const cJSON *keyStr = NULL;
+            SAFEGET(get_string_object(&keyStr, tc, "key"), "Missing `key' in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+            if(hex2bin(keyStr->valuestring, aKey) < 0)  {
+                printf("Key has invalid length in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                goto error_die;
+            }
+
+            /* Get plaintext if encrypt; ciphertext if decrypt */
+            int len = 0;
+		    memset(plaintext, 0, sizeof(plaintext));
+		    memset(ciphertext, 0, sizeof(ciphertext));
+
+            if(dir == 0)  { /* Decrypt */
+                const cJSON *ctStr = NULL;
+                SAFEGET(get_string_object(&ctStr, tc, "ct"), "Missing ciphertext in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                if((len = hex2bin(ctStr->valuestring, ciphertext)) < 0)  {
+                    printf("Ciphertext did not convert properly in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                    goto error_die;
+                }
+                if(len >= sizeof(ciphertext))  {
+                    printf("Ciphertext buffer overflow\n");
+                }
+            } else {
+                /* Encrypt */
+                const cJSON *ptStr = NULL;
+                SAFEGET(get_string_object(&ptStr, tc, "pt"), "Missing plaintext in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                if((len = hex2bin(ptStr->valuestring, plaintext)) < 0)  {
+                    printf("Plaintext did not convert properly in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                    goto error_die;
+                }
+                if(len >= sizeof(plaintext))  {
+                    printf("Plaintext buffer overflow\n");
+                }
+            }
+
+
+            if(strncmp("AFT", test_type->valuestring, 3) == 0)  {
+                /* Functional test */
+                /* The calling convention is the same since AESTest will figure out the parameters */
+                AESTest(&ctx, amode, akeysz, aKey, iVec,
+                    dir,  /* 0 = decrypt, 1 = encrypt */
+                    plaintext, ciphertext, len);
+
+                if(dir == 1)    /* Encrypt produces ciphertext */
+    		        OutputValue("CIPHERTEXT",ciphertext, len, rfp,
+        			    !strcmp(amode,"CFB1"));
+                else
+                    OutputValue("PLAINTEXT", plaintext, len, rfp,
+                            !strcmp(amode,"CFB1"));
+
+            } else if (strncmp("MCT", test_type->valuestring, 3) == 0)  {
+                /* Monte Carlo test */
+                if (dir == 0)  {    /* Decrypt */
+                    if(do_mct(amode, akeysz, aKey, iVec,
+                        dir, (unsigned char*)ciphertext, len,
+                        rfp) < 0) 
+                        goto error_die;
+                }
+                else  {             /* Encrypt */
+                    if(do_mct(amode, akeysz, aKey, iVec,
+                        dir, (unsigned char*)plaintext, len,
+                        rfp) < 0) 
+                        goto error_die;
+                }
+            } else if (strncmp("CTR", test_type->valuestring, 3) == 0)  {
+                /* CTR mode testing */
+                printf("CTR test\n");
+            } else  {
+                printf ("Unknown test type %s found in ACVP definition.\n", test_type->valuestring);
+                goto error_die;
+            }
+        }
+    }
+
+#if 0
+    AESTest(&ctx, amode, akeysz, aKey, iVec,
+            dir,  /* 0 = decrypt, 1 = encrypt */
+            plaintext, ciphertext, len);
+#endif
+    goto cleanup;
+
+error_die:
+    ret = -1;
+
+cleanup:
+    if(rfp)  fclose(rfp); rfp = NULL;
+    if(json) cJSON_Delete(json); json = NULL;
+    FIPS_cipher_ctx_cleanup(&ctx);
+
+    return ret;
+}
+
+static int proc_file_cavs(char *rqfile, char *rspfile)
     {
     char afn[256], rfn[256];
     FILE *afp = NULL, *rfp = NULL;
@@ -863,74 +1097,77 @@ static int proc_file(char *rqfile, char *rspfile)
 #ifdef FIPS_ALGVS
 int fips_aesavs_main(int argc, char **argv)
 #else
-int main(int argc, char **argv)
+int main(int argc, char **argv)  {
 #endif
-    {
     char *rqlist = "req.txt", *rspfile = NULL;
     FILE *fp = NULL;
     char fn[250] = "", rfn[256] = "";
     int d_opt = 1;
     fips_algtest_init();
+    int res = 0;
 
-    if (argc > 1)
-	{
-	if (fips_strcasecmp(argv[1], "-d") == 0)
-	    {
-	    d_opt = 1;
+    char *acvp = getenv("ACVP");
+    char *cavs = getenv("CAVS");
+
+    /* Set default if neither is set */
+    if(!acvp && !cavs)
+        cavs = 1;
+
+    if (argc > 1)  {
+	    if (fips_strcasecmp(argv[1], "-d") == 0)  {
+	        d_opt = 1;
+    	}
+	    else if (fips_strcasecmp(argv[1], "-f") == 0)  {
+	        d_opt = 0;
+    	}
+	    else  {
+	        printf("Invalid parameter: %s\n", argv[1]);
+    	    return 0;
 	    }
-	else if (fips_strcasecmp(argv[1], "-f") == 0)
-	    {
-	    d_opt = 0;
+    	if (argc < 3)  {
+	        printf("Missing parameter\n");
+	        return 0;
 	    }
-	else
-	    {
-	    printf("Invalid parameter: %s\n", argv[1]);
-	    return 0;
-	    }
-	if (argc < 3)
-	    {
-	    printf("Missing parameter\n");
-	    return 0;
-	    }
-	if (d_opt)
-	    rqlist = argv[2];
-	else
-	    {
-	    strcpy(fn, argv[2]);
-	    rspfile = argv[3];
-	    }
+    	if (d_opt)
+	        rqlist = argv[2];
+    	else  {
+	        strcpy(fn, argv[2]);
+	        rspfile = argv[3];
+    	}
 	}
-    if (d_opt)
-	{ /* list of files (directory) */
-	if (!(fp = fopen(rqlist, "r")))
-	    {
-	    printf("Cannot open req list file\n");
-	    return -1;
+    if (d_opt)  {
+	    /* list of files (directory) */
+	    if (!(fp = fopen(rqlist, "r")))  {
+    	    printf("Cannot open req list file\n");
+	        return -1;
 	    }
-	while (fgets(fn, sizeof(fn), fp))
-	    {
-	    strtok(fn, "\r\n");
-	    strcpy(rfn, fn);
+    	while (fgets(fn, sizeof(fn), fp))  {
+    	    strtok(fn, "\r\n");
+	        strcpy(rfn, fn);
+	        if (VERBOSE)
+    	    	printf("Processing: %s\n", rfn);
+	        if (proc_file_cavs(rfn, rspfile))  {
+        		printf(">>> Processing failed for: %s <<<\n", rfn);
+		        return 1;
+    		}
+	    }
+	    fclose(fp);
+	}
+    else  { /* single file */
 	    if (VERBOSE)
-		printf("Processing: %s\n", rfn);
-	    if (proc_file(rfn, rspfile))
-		{
-		printf(">>> Processing failed for: %s <<<\n", rfn);
-		return 1;
-		}
-	    }
-	fclose(fp);
+	        printf("Processing: %s\n", fn);
+        if (cavs)
+            res = proc_file_cavs(fn, rspfile);
+        else if (acvp)
+            res = proc_file_acvp(fn, rspfile);
+        else
+            printf("Unknown operational mode (CAVS or ACVP required).");
+
+        if (res)
+	        printf(">>> Processing failed for: %s <<<\n", fn);
 	}
-    else /* single file */
-	{
-	if (VERBOSE)
-	    printf("Processing: %s\n", fn);
-	if (proc_file(fn, rspfile))
-	    {
-	    printf(">>> Processing failed for: %s <<<\n", fn);
-	    }
-	}
+
     return 0;
-    }
+}
 
 #endif

@@ -5,7 +5,7 @@
 DIR=		test
 TOP=		..
 CC=		cc
-INCLUDES=	-I$(TOP) -I../include $(KRB5_INCLUDES) -I$(TOP)/fips
+INCLUDES=	-I$(TOP) -I../include $(KRB5_INCLUDES) -I$(TOP)/fips -I$(HOME)/dev/cJSON/include
 CFLAG=		-g
 MAKEDEPEND=	$(TOP)/util/domd $(TOP) -MD $(MAKEDEPPROG)
 PERL=		perl
@@ -28,6 +28,7 @@ DLIBSSL= ../libssl.a
 LIBCRYPTO= -L.. -lcrypto
 LIBSSL= -L.. -lssl
 LIBFIPS= -L.. -lfips
+LIBJSON=$(HOME)/dev/cJSON/libcjson.a
 
 BNTEST=		bntest
 ECTEST=		ectest
@@ -437,7 +438,7 @@ FIPS_BUILD_CMD=shlib_target=; if [ -n "$(SHARED_LIBS)" ]; then \
 	fi; \
 	$(MAKE) -f $(TOP)/Makefile.shared -e \
 		CC="$${CC}" APPNAME=$$target$(EXE_EXT) OBJECTS="$$target.o" \
-		LIBDEPS="$(PEX_LIBS) $$LIBRARIES $(EX_LIBS)" \
+		LIBDEPS="$(PEX_LIBS) $$LIBRARIES $(LIBJSON) $(EX_LIBS)" \
 		link_app.$${shlib_target}
 
 FIPS_CRYPTO_BUILD_CMD=shlib_target=; if [ -n "$(SHARED_LIBS)" ]; then \
