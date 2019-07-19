@@ -66,6 +66,9 @@
 #include <openssl/err.h>
 #include <openssl/bn.h>
 
+#include "acvp.h"
+
+
 #ifndef OPENSSL_FIPS
 
 int main(int argc, char *argv[])
@@ -80,7 +83,8 @@ int main(int argc, char *argv[])
 
 #include "fips_utl.h"
 
-static int dgst_test(FILE *out, FILE *in);
+static int dgst_test_cavs(FILE *out, FILE *in);
+static int dgst_test_acvp(FILE *out, FILE *in);
 static int print_dgst(const EVP_MD *md, FILE *out,
 		unsigned char *Msg, int Msglen);
 static int print_monte(const EVP_MD *md, FILE *out,
@@ -96,6 +100,12 @@ int main(int argc, char **argv)
 
 	int ret = 1;
 	fips_algtest_init();
+
+    int acvp = 0, cavs = 0;
+    if(select_mode(&cavs, &acvp) != 0)  {
+        printf("Unable to determine if CAVS or ACVP mode selected.\n");
+        return -1;
+    }
 
 	if (argc == 1)
 		in = stdin;
@@ -119,7 +129,15 @@ int main(int argc, char **argv)
 		goto end;
 		}
 
-	if (!dgst_test(out, in))
+    int res = 0;
+    if (cavs)
+        res = dgst_test_cavs(out, in);
+    else if (acvp)
+        res = dgst_test_acvp(out, in);
+    else
+        printf("Unknown operational mode (CAVS or ACVP required).");
+
+    if (!res)
 		{
 		fprintf(stderr, "FATAL digest file processing error\n");
 		goto end;
@@ -141,7 +159,132 @@ int main(int argc, char **argv)
 #define SHA_TEST_MAX_BITS	102400
 #define SHA_TEST_MAXLINELEN	(((SHA_TEST_MAX_BITS >> 3) * 2) + 100)
 
-int dgst_test(FILE *out, FILE *in)
+int dgst_test_acvp(FILE *out, FILE *in)  {
+	const EVP_MD *md = NULL;
+	unsigned char *Msg = NULL;
+	long MsgLen = -1, Len = -1;
+	int ret = 0;
+    cJSON *json = NULL;
+
+    if ((json = read_fd_as_json(in)) == NULL)  {
+        printf("Cannot parse JSON file\n");
+        goto error_die;
+    }
+
+    /* Check version is correct */
+    if (!verify_acvp_version(json, "1.0"))  {
+        printf("ACVP version number is not expected.");
+        goto error_die;
+    }
+
+
+    /* Vector set */
+    const cJSON *vs = NULL;
+    SAFEGET(get_array_item(&vs, json, 1), "Vector set missing in JSON\n");
+
+    /* Need the algorithm function, the msg and the length */
+    const cJSON *algStr = NULL;
+    SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
+
+    if(!strncmp("SHA-1", algStr->valuestring, 8))   /* UNTESTED! */
+        md=EVP_sha1();
+    else if(!strncmp("SHA2-224", algStr->valuestring, 8))
+        md=EVP_sha224();
+    else if (!strncmp("SHA2-256", algStr->valuestring, 8))
+        md=EVP_sha256();
+    else if (!strncmp("SHA2-384", algStr->valuestring, 8))
+        md=EVP_sha384();
+    else if (!strncmp("SHA2-512", algStr->valuestring, 8))
+        md=EVP_sha512();
+    else {
+        printf("Unknown message digest algorithm `%s'\n", algStr->valuestring);
+        goto error_die;
+    }
+
+
+    /* For each test group
+     *      For each test case
+     *          Process...
+     */
+    const cJSON *tgs = NULL;
+    SAFEGET(get_object(&tgs, vs, "testGroups"), "Missing 'testGroups' in input JSON\n");
+    const cJSON *tg = NULL;
+    cJSON_ArrayForEach(tg, tgs)  {
+        if(!tg)  {
+            printf("Test groups array is missing test group object.\n");
+            goto error_die;
+        }
+
+        /* Get test group ID */
+        const cJSON *tgId = NULL;
+        SAFEGET(get_integer_object(&tgId, tg, "tgId"), "Missing test group id!\n");
+        /* Get test type */
+        const cJSON *test_type = NULL;
+        SAFEGET(get_string_object(&test_type, tg, "testType"), "Missing `testType' in input JSON\n");
+
+        /* Now iterate over the test cases */
+        const cJSON *tests = NULL;
+        SAFEGET(get_object(&tests, tg, "tests"), "Missing test cases in test group %d\n", tgId->valueint);
+
+        const cJSON *tc = NULL;
+        cJSON_ArrayForEach(tc, tests)  {
+            if(!tc)  {
+                printf("Test groups array is missing test cases.");
+                goto error_die;
+            }
+
+            /* Get test case ID */
+            const cJSON *tcId = NULL;
+            SAFEGET(get_integer_object(&tcId, tc, "tcId"), "Missing test case id in test group %d!\n", tgId->valueint);
+
+            const cJSON *msgStr = NULL;
+            SAFEGET(get_string_object(&msgStr, tc, "msg"), "Missing message in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+            const cJSON *msgLen = NULL;
+            SAFEGET(get_integer_object(&msgLen, tc, "len"), "Missing message length in test %d in test group %d\n", tcId->valueint, tgId->valueint);
+
+            Len = msgLen->valueint;
+            if (Len < 0)
+                goto error_die;
+            /* Only handle multiples of 8 bits */
+            if (Len & 0x7)
+                goto error_die;
+            if (Len > SHA_TEST_MAX_BITS)
+                goto error_die;
+            MsgLen = Len >> 3;
+
+            long tmplen = 0;
+            Msg = hex2bin_m(msgStr->valuestring, &tmplen);
+
+            if(!strncmp("AFT", test_type->valuestring, 3))  {
+    			if (!print_dgst(md, out, Msg, MsgLen))
+	    			goto error_die;
+            }
+            else if (!strncmp("MCT", test_type->valuestring, 3))  {
+			    if (!print_monte(md, out, Msg, MsgLen))
+				    goto error_die;
+            }
+			OPENSSL_free(Msg);
+			Msg = NULL;
+			MsgLen = -1;
+			Len = -1;
+        }
+    }
+
+    ret = 1;
+    goto cleanup;
+
+
+error_die:
+    ret = 0;
+
+cleanup:
+    if(json) cJSON_Delete(json); json = NULL;
+	if (Msg) OPENSSL_free(Msg); Msg = NULL;
+
+    return ret;
+}
+
+int dgst_test_cavs(FILE *out, FILE *in)
 	{
 	const EVP_MD *md = NULL;
 	char *linebuf, *olinebuf, *p, *q;

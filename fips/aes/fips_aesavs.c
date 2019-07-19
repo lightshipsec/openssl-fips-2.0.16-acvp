@@ -610,13 +610,7 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
     }
 
     /* Check version is correct */
-    const cJSON *a0 = NULL;
-    SAFEGET(get_array_item(&a0, json, 0), "JSON not structured properly\n");
-
-    const cJSON *versionStr = NULL;
-    SAFEGET(get_string_object(&versionStr, a0, "acvVersion"), "Version identifier is missing\n");
-
-    assert(strncmp("1.0", versionStr->valuestring, 3) == 0);
+    assert(verify_acvp_version(json, "1.0"));
 
     /* Now get the pertinent details */
     const cJSON *vs = NULL;
@@ -705,7 +699,11 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
             if(dir == 0)  { /* Decrypt */
                 const cJSON *ctStr = NULL;
                 SAFEGET(get_string_object(&ctStr, tc, "ct"), "Missing ciphertext in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
-                if((len = hex2bin(ctStr->valuestring, ciphertext)) < 0)  {
+		        if(!strcmp(amode,"CFB1"))
+		            len = bint2bin(ctStr->valuestring, strlen(ctStr->valuestring), ciphertext);
+                else
+                    len = hex2bin(ctStr->valuestring, ciphertext);
+                if(len < 0)  {
                     printf("Ciphertext did not convert properly in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
                     goto error_die;
                 }
@@ -716,7 +714,11 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
                 /* Encrypt */
                 const cJSON *ptStr = NULL;
                 SAFEGET(get_string_object(&ptStr, tc, "pt"), "Missing plaintext in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
-                if((len = hex2bin(ptStr->valuestring, plaintext)) < 0)  {
+		        if(!strcmp(amode,"CFB1"))
+		            len = bint2bin(ptStr->valuestring, strlen(ptStr->valuestring), plaintext);
+                else
+                    len = hex2bin(ptStr->valuestring, plaintext);
+                if(len < 0)  {
                     printf("Plaintext did not convert properly in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
                     goto error_die;
                 }
@@ -1106,13 +1108,11 @@ int main(int argc, char **argv)  {
     fips_algtest_init();
     int res = 0;
 
-    char *acvp = getenv("ACVP");
-    char *cavs = getenv("CAVS");
-
-    /* Set default if neither is set */
-    if(!acvp && !cavs)
-        cavs = 1;
-
+    int acvp = 0, cavs = 0;
+    if(select_mode(&cavs, &acvp) != 0)  {
+        printf("Unable to determine if CAVS or ACVP mode selected.\n");
+        return -1;
+    }
     if (argc > 1)  {
 	    if (fips_strcasecmp(argv[1], "-d") == 0)  {
 	        d_opt = 1;
