@@ -1,3 +1,6 @@
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
+
 #include <cjson/cJSON.h>
 
 /* Assumes caller has `error_die' guards set up.
@@ -11,18 +14,128 @@
         } \
     }
 
+#define SAFEPUT(call, error, ...)   \
+    if(call != 0) { \
+        if(error)  { \
+            printf(error, ## __VA_ARGS__); \
+            goto error_die; \
+        } \
+    }
+
+
+static int cavs = 0;
+static int acvp = 0;
+
 /* Initializer */
-int select_mode(int *cavs, int *acvp)  {
-    if(!cavs && !acvp) return -1;
+int select_mode(void)  {
     if (getenv("ACVP"))
-        *acvp = 1;
+        acvp = 1;
     if (getenv("CAVS"))
-        *cavs = 1;
+        cavs = 1;
     /* Set default if neither is set */
-    if(!*acvp && !*cavs)
-        *cavs = 1;
+    if(!acvp && !cavs)
+        cavs = 1;
     return 0;
 }
+
+/* Utility functions */
+
+int get_object(cJSON **to, const cJSON *from, char *name) {
+    if(!from || !name || !to) return -1;
+    cJSON *t = cJSON_GetObjectItemCaseSensitive((cJSON *)from, name);
+    if(!t) return -1;
+    *to = t;
+    return 0;
+}
+int get_array_item(cJSON **to, const cJSON *from, int index) {
+    if(!from || !to || index<0) return -1;
+    cJSON *t = cJSON_GetArrayItem((cJSON *)from, index);
+    if(!t) return -1;
+    *to = t;
+    return 0;
+}
+int get_string_object(cJSON **to, const cJSON *from, char *name) {
+    if(!from || !name || !to) return -1;
+    cJSON *t = cJSON_GetObjectItemCaseSensitive((cJSON *)from, name);
+    if(!t) return -1;
+    *to = t;
+    return 0;
+}
+int get_integer_object(cJSON **to, const cJSON *from, char *name) {
+    if(!from || !name || !to) return -1;
+    cJSON *t = cJSON_GetObjectItemCaseSensitive((cJSON *)from, name);
+    if(!t) return -1;
+    *to = t;
+    return 0;
+}
+
+/* Appends; else use cJSON_InsertItemInArray to insert */
+int put_array_item(cJSON *obj, cJSON *to_arr)  {
+    if(!to_arr || !obj) return -1;
+    /* Get array size before adding */
+    //int before = cJSON_GetArraySize(to_arr);
+    cJSON_AddItemToArray(to_arr, obj);
+    //int after = cJSON_GetArraySize(to_arr);
+    //if (after != (before + 1)) return -1;
+    return 0;
+}
+/* Any object */
+int put_object(char *name, cJSON *obj, cJSON *to)  {
+    if(!to || !obj || !name) return -1;
+    cJSON_AddItemToObject(to, name, obj);
+    return 0;
+}
+
+/* Specific objects */
+int put_string(const char *name, const unsigned char *value, cJSON *to) { 
+    if(!to || !name) return -1;
+    cJSON *s = cJSON_CreateString((const char *)value);
+    if(!s) return -1;
+    int before = 0, after = 0;
+    if (cJSON_IsArray(to))
+        before = cJSON_GetArraySize(to);
+
+    cJSON_AddItemToObject(to, name, s);
+    /* Unfortunately, the current cJSON API does not check if the addition was successful.
+     * Therefore, we check if the object is in there after adding.
+     */
+    cJSON *verify = NULL;
+    if (cJSON_IsObject(to))  {
+        int err = get_string_object(&verify, (const cJSON *)to, (char *)name); 
+        if (err < 0 || !verify) return -1;
+    } else if (cJSON_IsArray(to))  {
+        after = cJSON_GetArraySize(to);
+        if (after != (before + 1)) return -1;
+        verify = cJSON_GetArrayItem(to, after-1);
+    }
+    if (strncmp((const char *)value, verify->valuestring, strlen((const char *)value)) != 0) return -1;
+    return 0;
+}
+int put_integer(const char *name, int value, cJSON *to) {
+    if(!to || !name) return -1;
+    cJSON *s = cJSON_CreateNumber(value);
+    if(!s) return -1;
+    int before = 0, after = 0;
+    if (cJSON_IsArray(to))
+        before = cJSON_GetArraySize(to);
+
+    cJSON_AddItemToObject(to, name, s);
+    /* Unfortunately, the current cJSON API does not check if the addition was successful.
+     * Therefore, we check if the object is in there after adding.
+     */
+    cJSON *verify = NULL;
+    if (cJSON_IsObject(to))  {
+        int err = get_integer_object(&verify, (const cJSON *)to, (char *)name); 
+        if (err < 0 || !verify) return -1;
+    } else if (cJSON_IsArray(to))  {
+        after = cJSON_GetArraySize(to);
+        if (after != (before + 1)) return -1;
+        verify = cJSON_GetArrayItem(to, after-1);
+    }
+    if (value != verify->valueint) return -1;
+    return 0;
+}
+
 
 int verify_acvp_version(cJSON *json, const char *check)  {
     /* Data is parsed already; now we need to extract everything to give to the caller. */
@@ -33,10 +146,10 @@ int verify_acvp_version(cJSON *json, const char *check)  {
     }
 
     /* Check version is correct */
-    const cJSON *a0 = NULL;
+    cJSON *a0 = NULL;
     SAFEGET(get_array_item(&a0, json, 0), "JSON not structured properly\n");
 
-    const cJSON *versionStr = NULL;
+    cJSON *versionStr = NULL;
     SAFEGET(get_string_object(&versionStr, a0, "acvVersion"), "Version identifier is missing\n");
     return strncmp(check, versionStr->valuestring, 3) == 0;
 
@@ -44,32 +157,39 @@ error_die:
     return -1;
 }
 
-/* Utility functions */
+cJSON *init_output(cJSON *json)  {
+    /* Take in the initial structure and copy the necessary pieces out */
 
-int get_object(cJSON **to, const cJSON *from, char *name) {
-    cJSON *t = cJSON_GetObjectItemCaseSensitive(from, name);
-    if(!t || !to) return -1;
-    *to = t;
-    return 0;
+    /* Data is parsed already; now we need to extract everything to give to the caller. */
+    /* Validate that the structure is sound and conforms with the expected structure format. */
+    if (cJSON_GetArraySize(json) != 2)  {
+        printf("Expecting array of size 2 in top-level JSON. Check input format.\n");
+        goto error_die;
+    }
+
+    /* Check version is correct */
+    cJSON *a0 = NULL;
+    SAFEGET(get_array_item(&a0, json, 0), "JSON not structured properly\n");
+
+    cJSON *versionStr = NULL;
+    SAFEGET(get_string_object(&versionStr, a0, "acvVersion"), "Version identifier is missing\n");
+
+    cJSON *out_versionObj = cJSON_CreateObject();
+    SAFEPUT(put_string("acvVersion", (const unsigned char *)versionStr->valuestring, out_versionObj), "Unable to add version string");
+
+    cJSON *output = cJSON_CreateArray();
+    if (!output) return NULL;
+    SAFEPUT(put_array_item(out_versionObj, output), "Unable to add version string to output structure");
+
+    goto success;
+
+error_die:
+    if (output) cJSON_Delete(output); output = NULL;
+
+success:
+    return output;
 }
-int get_array_item(cJSON **to, const cJSON *from, int index) {
-    cJSON *t = cJSON_GetArrayItem(from, index);
-    if(!t || !to) return -1;
-    *to = t;
-    return 0;
-}
-int get_string_object(cJSON **to, const cJSON *from, char *name) {
-    cJSON *t = cJSON_GetObjectItemCaseSensitive(from, name);
-    if(!t || !to) return -1;
-    *to = t;
-    return 0;
-}
-int get_integer_object(cJSON **to, const cJSON *from, char *name) {
-    cJSON *t = cJSON_GetObjectItemCaseSensitive(from, name);
-    if(!t || !to) return -1;
-    *to = t;
-    return 0;
-}
+
 
 /**
  * Read a file into a memory buffer
@@ -149,3 +269,22 @@ cJSON *read_file_as_json(char *fn)  {
     fd = NULL;
     return json;
 }
+
+unsigned char *bin2hex(unsigned char *bin, int bin_len, unsigned char *hex, int hex_len)  {
+    if (!hex || (bin_len*2+1 > hex_len)) return NULL;
+    for(int i=0, j=0; i < bin_len; i++, j+=2)
+       sprintf((char *)&hex[j], "%02X", bin[i]);
+    hex[bin_len*2] = '\x0';
+    return hex;
+}
+
+unsigned char *bin2hex_m(unsigned char *bin, int bin_len, unsigned char **hex)  {
+    if (!hex) return NULL;
+    unsigned char *hex_r = *hex;
+    hex_r = malloc(bin_len*2+1);
+    *hex = bin2hex(bin, bin_len, hex_r, bin_len*2+1);
+    return hex_r;
+}
+
+
+#pragma GCC diagnostic pop

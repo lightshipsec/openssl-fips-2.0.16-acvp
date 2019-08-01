@@ -248,10 +248,40 @@ enum XCrypt {XDECRYPT, XENCRYPT};
 #define gb(a,b) (((a)[(b)/8] >> (7-(b)%8))&1)
 #define sb(a,b,v) ((a)[(b)/8]=((a)[(b)/8]&~(1 << (7-(b)%8)))|(!!(v) << (7-(b)%8)))
 
+int construct_acvp_mct_iter(int iter, int imode, unsigned char *key, int keylen, unsigned char *iv, int dir, unsigned char *text, int len, cJSON *node)  {
+    int ret = 0;
+    /* Just need key, iv, pt, ct in a new result */
+    unsigned char key_hex[keylen*2+1];
+    unsigned char iv_hex[AES_BLOCK_SIZE*2+1];
+    unsigned char result_hex[len*2+1];
+
+    SAFEPUT(put_string("key", bin2hex(key, keylen, &key_hex[0], sizeof(key_hex)), node), "Unable to construct key output for MCT iteration %d\n", iter);
+
+    if (imode != ECB) /* ECB */
+        SAFEPUT(put_string("iv", bin2hex(iv, AES_BLOCK_SIZE, &iv_hex[0], sizeof(iv_hex)), node), "Unable to construct IV output for MCT iteration %d\n", iter);
+
+    if (dir == 0)  {       /* Decrypt */
+        if (imode == CFB1)  {
+            /* If CFB1, then need to bit output */
+        }
+        SAFEPUT(put_string("ct", bin2hex(text, len, &result_hex[0], sizeof (result_hex)), node), "Unable to construct CT output for MCT iteration %d\n", iter);
+    } else  {       /* Encrypt */
+        if (imode == CFB1)  {
+            /* If CFB1, then need to bit output */
+        }
+        SAFEPUT(put_string("pt", bin2hex(text, len, &result_hex[0], sizeof(result_hex)), node), "Unable to construct PT output for MCT iteration %d\n", iter);
+    }
+    goto success;
+error_die:
+    ret = -1;
+success:
+    return ret;
+}
+
 static int do_mct(char *amode, 
 	   int akeysz, unsigned char *aKey,unsigned char *iVec,
 	   int dir, unsigned char *text, int len,
-	   FILE *rfp)
+	   FILE *rfp, cJSON *node)
     {
     int ret = 0;
     unsigned char key[101][32];
@@ -263,6 +293,15 @@ static int do_mct(char *amode,
     int imode = 0, nkeysz = akeysz/8;
     EVP_CIPHER_CTX ctx;
     FIPS_cipher_ctx_init(&ctx);
+
+    if (cavs && !rfp)  {
+        printf ("Missing response file for CAVS output\n");
+        return -1;
+    }
+    if (acvp && !node)  {
+        printf ("Missing JSON node for ACVP output\n");
+        return -1;
+    }
 
     if (len > 32)
 	{
@@ -288,17 +327,43 @@ static int do_mct(char *amode,
 	memcpy(ctext[0], text, len);
     for (i = 0; i < 100; ++i)
 	{
+    cJSON *mct_iter = cJSON_CreateObject ();
+    if (acvp)  {
+        /* Add to output, which is an array */
+        SAFEPUT(put_array_item (mct_iter, node), "Unable to allocate MCT iteration in output JSON node\n");
+    }
 	/* printf("Iteration %d\n", i); */
-	if (i > 0)
-	    {
-	    fprintf(rfp,"COUNT = %d" RESP_EOL ,i);
-	    OutputValue("KEY",key[i],nkeysz,rfp,0);
-	    if (imode != ECB)  /* ECB */
-		OutputValue("IV",iv[i],AES_BLOCK_SIZE,rfp,0);
-	    /* Output Ciphertext | Plaintext */
-	    OutputValue(t_tag[dir^1],dir ? ptext[0] : ctext[0],len,rfp,
-			imode == CFB1);
-	    }
+    /**
+     * Note that do_mct() is called from the processing function.
+     * The processing function is supposed to output all of the initial
+     * values for iteration 0 before calling do_mct() via copy_line. 
+     * This is why the i > 0 is done whereas down below, the 
+     * ciphertext/plaintext is emitted without any other key/count/iv 
+     * information on the initial iteration.
+     * For ACVP, this doesn't work so well, so we need to emit the
+     * initial information in the 0th iteration.
+     */
+
+    if (i == 0 && acvp)  {
+        if (construct_acvp_mct_iter(i, imode, aKey, nkeysz, iVec, dir, text, len, mct_iter) != 0) 
+            goto error_die;
+    }
+	if (i > 0)  {
+        if(cavs)  {
+    	    fprintf(rfp,"COUNT = %d" RESP_EOL ,i);
+	        OutputValue("KEY",key[i],nkeysz,rfp,0);
+	        if (imode != ECB)  /* ECB */
+                OutputValue("IV",iv[i],AES_BLOCK_SIZE,rfp,0);
+    	    /* Output Ciphertext | Plaintext */
+	        OutputValue(t_tag[dir^1],dir ? ptext[0] : ctext[0],len,rfp,
+		        imode == CFB1);
+        }
+        if (acvp)  {
+            if (construct_acvp_mct_iter(i, imode, key[i], nkeysz, iv[i], dir, dir ? ptext[0] : ctext[0], len, mct_iter) != 0) 
+                goto error_die;
+        }   /* End of ACVP output for i > 0 */
+	}   /* End of Check for i > 0 */
+
 	for (j = 0; j < 1000; ++j)
 	    {
 	    switch (imode)
@@ -425,9 +490,27 @@ static int do_mct(char *amode,
 	    }
 	--j; /* reset to last of range */
 	/* Output Ciphertext | Plaintext */
-	OutputValue(t_tag[dir],dir ? ctext[j] : ptext[j],len,rfp,
+    if(cavs)  {
+    	OutputValue(t_tag[dir],dir ? ctext[j] : ptext[j],len,rfp,
 		    imode == CFB1);
-	fprintf(rfp, RESP_EOL);  /* add separator */
+	    fprintf(rfp, RESP_EOL);  /* add separator */
+    }
+    if(acvp)  {
+        /* Output the other side */
+        if (!strcmp (amode, "CFB1"))  {
+            /* CFB1 mode reqiures bit-oriented output */
+            /* The number of bytes to accommodate n bits in output is (n+7)/8 */
+            len = (len+7)/8;
+        }
+
+        if (dir == 0)  {      /* Decrypt */
+            unsigned char result_hex[sizeof(ptext[j])*2+1];
+            SAFEPUT(put_string("pt", bin2hex(ptext[j], len, &result_hex[0], sizeof(result_hex)), mct_iter), "Unable to construct PT output for MCT iteration %d\n", i);
+        } else {            /* Encrypt */
+            unsigned char result_hex[sizeof(ctext[j])*2+1];
+            SAFEPUT(put_string("ct", bin2hex(ctext[j], len, &result_hex[0], sizeof(result_hex)), mct_iter), "Unable to construct CT output for MCT iteration %d\n", i);
+        }
+    }   /* End of ACVP/CAVS check */
 
 	/* Compute next KEY */
 	if (dir == XENCRYPT)
@@ -543,6 +626,7 @@ static int do_mct(char *amode,
 		}
 	    }
 	}
+error_die:
     FIPS_cipher_ctx_cleanup(&ctx);
     return ret;
     }
@@ -568,6 +652,7 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
     unsigned char iVec[20], aKey[40];
     unsigned char plaintext[2048];
     unsigned char ciphertext[2048];
+    unsigned char result_hex[2048];
 
     EVP_CIPHER_CTX ctx;
     FIPS_cipher_ctx_init(&ctx);
@@ -612,36 +697,56 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
     /* Check version is correct */
     assert(verify_acvp_version(json, "1.0"));
 
+    /* Initialize output structure */
+    cJSON *output = init_output (json);
+
     /* Now get the pertinent details */
-    const cJSON *vs = NULL;
+    cJSON *vs = NULL;
     SAFEGET(get_array_item(&vs, json, 1), "Vector set missing in JSON\n");
-    const cJSON *algStr = NULL;
+    cJSON *algStr = NULL;
     SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
-    /* Algorithm mode is last 3 chars */
-    strncpy(amode, &algStr->valuestring[strlen(algStr->valuestring)-3], 3);
-    amode[4] = '\x0';
+    /* Algorithm mode is last chars after last hyphen. */
+    strcpy(amode, strrchr(algStr->valuestring, '-')+1);
 
     /* For each test group
      *      For each test case
      *          Process...
      */
-    const cJSON *tgs = NULL;
+    cJSON *tgs = NULL;
     SAFEGET(get_object(&tgs, vs, "testGroups"), "Missing 'testGroups' in input JSON\n");
-    const cJSON *tg = NULL;
+
+    /* Construct the (empty) response body */
+    cJSON *response = cJSON_CreateObject ();
+    cJSON *vsId = NULL;
+    SAFEGET (get_integer_object (&vsId, vs, "vsId"), "vsId missing in JSON\n");
+    SAFEPUT (put_integer ("vsId", vsId->valueint, response), "Unable to add vsId to output JSON\n");
+    cJSON *tgs_output = cJSON_CreateArray ();
+    SAFEPUT (put_object ("testGroups", tgs_output, response), "Unable to add testGroups to output JSON\n");
+
+    SAFEPUT (put_array_item (response, output), "Unable to add response body to JSON\n");
+
+    cJSON *tg = NULL;
     cJSON_ArrayForEach(tg, tgs)  {
+        cJSON *tg_output = cJSON_CreateObject ();
+        /* Add to output */
+        SAFEPUT (put_array_item (tg_output, tgs_output), "Unable to append test group to output\n");
+
         if(!tg)  {
             printf("Test groups array is missing test group object.\n");
             goto error_die;
         }
 
         /* Get test group ID */
-        const cJSON *tgId = NULL;
+        cJSON *tgId = NULL;
         SAFEGET(get_integer_object(&tgId, tg, "tgId"), "Missing test group id!\n");
 
+        /* Copy tgId to output */
+        SAFEPUT (put_integer ("tgId", tgId->valueint, tg_output), "Unable to add tgId to test group %d\n", tgId->valueint);
+
         /* Get test type (used later) and direction */
-        const cJSON *test_type = NULL;
+        cJSON *test_type = NULL;
         SAFEGET(get_string_object(&test_type, tg, "testType"), "Missing `testType' in input JSON\n");
-        const cJSON *direction = NULL;
+        cJSON *direction = NULL;
         SAFEGET(get_string_object(&direction, tg, "direction"), "Missing `direction' in input JSON\n");
         if(strncmp("encrypt", direction->valuestring, 7) == 0)
             dir = 1;
@@ -652,23 +757,33 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
         }
 
         /* Get key length */
-        const cJSON *keyLen = NULL;
+        cJSON *keyLen = NULL;
         SAFEGET(get_integer_object(&keyLen, tg, "keyLen"), "Missing `keyLen' in input JSON\n");
 
         /* Now iterate over the test cases */
-        const cJSON *tests = NULL;
+        cJSON *tests = NULL;
         SAFEGET(get_object(&tests, tg, "tests"), "Missing test cases in test group %d\n", tgId->valueint);
 
-        const cJSON *tc = NULL;
+        cJSON *tests_output = cJSON_CreateArray ();
+        SAFEPUT (put_object ("tests", tests_output, tg_output), "Unable to add tests array to output JSON for test group %d\n", tgId->valueint);
+
+        cJSON *tc = NULL;
         cJSON_ArrayForEach(tc, tests)  {
+            cJSON *tc_output = cJSON_CreateObject ();
+            /* Add to output */
+            SAFEPUT (put_array_item (tc_output, tests_output), "Unable to append test case to test case array for group %d in JSON output\n", tgId->valueint);
+
             if(!tc)  {
                 printf("Test groups array is missing test cases.");
                 goto error_die;
             }
 
             /* Get test case ID */
-            const cJSON *tcId = NULL;
+            cJSON *tcId = NULL;
             SAFEGET(get_integer_object(&tcId, tc, "tcId"), "Missing test case id in test group %d!\n", tgId->valueint);
+
+            /* Copy back to output */
+            SAFEPUT (put_integer ("tcId", tcId->valueint, tc_output), "Unable to provide tcId to test case %d in test group %d in JSON output\n", tcId->valueint, tgId->valueint);
 
             /* Get key and IV */
             akeysz = keyLen->valueint;
@@ -684,7 +799,7 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
                 }
             }
 
-            const cJSON *keyStr = NULL;
+            cJSON *keyStr = NULL;
             SAFEGET(get_string_object(&keyStr, tc, "key"), "Missing `key' in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
             if(hex2bin(keyStr->valuestring, aKey) < 0)  {
                 printf("Key has invalid length in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
@@ -696,13 +811,22 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
 		    memset(plaintext, 0, sizeof(plaintext));
 		    memset(ciphertext, 0, sizeof(ciphertext));
 
+            /* We will use the CFB1 payloadLen later in other places, so do up here */
+            cJSON *payloadLen = NULL;
+            if (!strcmp(amode,"CFB1"))  {
+                /* Length has to be restated as length in bits of most significant bits */
+                SAFEGET(get_integer_object(&payloadLen, tc, "payloadLen"), "Missing payloadLen in CFB1 test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+            }
+
             if(dir == 0)  { /* Decrypt */
-                const cJSON *ctStr = NULL;
+                cJSON *ctStr = NULL;
                 SAFEGET(get_string_object(&ctStr, tc, "ct"), "Missing ciphertext in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
-		        if(!strcmp(amode,"CFB1"))
-		            len = bint2bin(ctStr->valuestring, strlen(ctStr->valuestring), ciphertext);
-                else
-                    len = hex2bin(ctStr->valuestring, ciphertext);
+                len = hex2bin(ctStr->valuestring, ciphertext);
+                if (!strcmp(amode,"CFB1"))  {
+                    /* Length has to be restated as length in bits of most significant bits */
+                    len = payloadLen->valueint;
+                }
+
                 if(len < 0)  {
                     printf("Ciphertext did not convert properly in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
                     goto error_die;
@@ -712,12 +836,13 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
                 }
             } else {
                 /* Encrypt */
-                const cJSON *ptStr = NULL;
+                cJSON *ptStr = NULL;
                 SAFEGET(get_string_object(&ptStr, tc, "pt"), "Missing plaintext in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
-		        if(!strcmp(amode,"CFB1"))
-		            len = bint2bin(ptStr->valuestring, strlen(ptStr->valuestring), plaintext);
-                else
-                    len = hex2bin(ptStr->valuestring, plaintext);
+                len = hex2bin(ptStr->valuestring, plaintext);
+                if (!strcmp(amode,"CFB1"))  {
+                    /* Length has to be restated as length in bits of most significant bits */
+                    len = payloadLen->valueint;
+                }
                 if(len < 0)  {
                     printf("Plaintext did not convert properly in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
                     goto error_die;
@@ -735,30 +860,33 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
                     dir,  /* 0 = decrypt, 1 = encrypt */
                     plaintext, ciphertext, len);
 
-                if(dir == 1)    /* Encrypt produces ciphertext */
-    		        OutputValue("CIPHERTEXT",ciphertext, len, rfp,
-        			    !strcmp(amode,"CFB1"));
-                else
-                    OutputValue("PLAINTEXT", plaintext, len, rfp,
-                            !strcmp(amode,"CFB1"));
-
+                if (!strcmp (amode, "CFB1"))  {
+                    /* CFB1 mode reqiures bit-oriented output */
+                    /* The number of bytes to accommodate n bits in output is (n+7)/8 */
+                    len = (len+7)/8;
+                }
+                if(dir == 1)  {    /* Encrypt produces ciphertext */
+                    SAFEPUT(put_string("ct", bin2hex(ciphertext, len, result_hex, sizeof(result_hex)), tc_output), "Unable to add ciphertext to output");
+                } else {
+                    SAFEPUT(put_string("pt", bin2hex(plaintext, len, result_hex, sizeof(result_hex)), tc_output), "Unable to add plaintext to output");
+                }
             } else if (strncmp("MCT", test_type->valuestring, 3) == 0)  {
                 /* Monte Carlo test */
+                /* Add results array to structure */
+                cJSON *mct_results = cJSON_CreateArray ();
+                SAFEPUT(put_object ("resultsArray", mct_results, tc_output),  "Unable to allocate resultsArray for MCT in test group %d\n", tgId->valueint);
                 if (dir == 0)  {    /* Decrypt */
                     if(do_mct(amode, akeysz, aKey, iVec,
                         dir, (unsigned char*)ciphertext, len,
-                        rfp) < 0) 
+                        NULL, mct_results) < 0) 
                         goto error_die;
                 }
                 else  {             /* Encrypt */
                     if(do_mct(amode, akeysz, aKey, iVec,
                         dir, (unsigned char*)plaintext, len,
-                        rfp) < 0) 
+                        NULL, mct_results) < 0) 
                         goto error_die;
                 }
-            } else if (strncmp("CTR", test_type->valuestring, 3) == 0)  {
-                /* CTR mode testing */
-                printf("CTR test\n");
             } else  {
                 printf ("Unknown test type %s found in ACVP definition.\n", test_type->valuestring);
                 goto error_die;
@@ -771,14 +899,19 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
             dir,  /* 0 = decrypt, 1 = encrypt */
             plaintext, ciphertext, len);
 #endif
+    printf ("%s\n", cJSON_Print (output));
     goto cleanup;
 
 error_die:
     ret = -1;
 
 cleanup:
-    if(rfp)  fclose(rfp); rfp = NULL;
-    if(json) cJSON_Delete(json); json = NULL;
+    if(rfp)  
+        fclose(rfp); 
+    rfp = NULL;
+    if(json) 
+        cJSON_Delete(json); 
+    json = NULL;
     FIPS_cipher_ctx_cleanup(&ctx);
 
     return ret;
@@ -1012,7 +1145,7 @@ static int proc_file_cavs(char *rqfile, char *rspfile)
 		    {
 		    if(do_mct(amode, akeysz, aKey, iVec, 
 			      dir, (unsigned char*)plaintext, len, 
-			      rfp) < 0)
+			      rfp, NULL) < 0)
 			err = 1;
 		    }
 		else
@@ -1051,7 +1184,7 @@ static int proc_file_cavs(char *rqfile, char *rspfile)
 		if (strcmp(atest, "MCT") == 0)  /* Monte Carlo Test */
 		    {
 		    do_mct(amode, akeysz, aKey, iVec, 
-			   dir, ciphertext, len, rfp);
+			   dir, ciphertext, len, rfp, NULL);
 		    }
 		else
 		    {
@@ -1108,8 +1241,7 @@ int main(int argc, char **argv)  {
     fips_algtest_init();
     int res = 0;
 
-    int acvp = 0, cavs = 0;
-    if(select_mode(&cavs, &acvp) != 0)  {
+    if(select_mode() != 0)  {
         printf("Unable to determine if CAVS or ACVP mode selected.\n");
         return -1;
     }
