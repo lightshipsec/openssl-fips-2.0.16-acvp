@@ -68,6 +68,13 @@ int get_integer_object(cJSON **to, const cJSON *from, char *name) {
     *to = t;
     return 0;
 }
+int get_boolean_object(cJSON **to, const cJSON *from, char *name) {
+    if(!from || !name || !to) return -1;
+    cJSON *t = cJSON_GetObjectItemCaseSensitive((cJSON *)from, name);
+    if(!t) return -1;
+    *to = t;
+    return 0;
+}
 
 /* Appends; else use cJSON_InsertItemInArray to insert */
 int put_array_item(cJSON *obj, cJSON *to_arr)  {

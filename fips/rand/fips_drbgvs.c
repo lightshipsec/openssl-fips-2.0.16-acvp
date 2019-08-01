@@ -76,6 +76,10 @@ int main(int argc, char **argv)
 
 #include "fips_utl.h"
 
+#include <assert.h>
+#include "acvp.h"
+
+
 static int dparse_md(char *str)
 	{
 	switch(atoi(str + 5))
@@ -196,8 +200,16 @@ int main(int argc,char **argv)
 
 	int gen = 0;
 
+    int ret = 0;
+    cJSON *json = NULL;
+    cJSON *output = NULL;
+
 	fips_algtest_init();
 
+    if(select_mode() != 0)  {
+        printf("Unable to determine if CAVS or ACVP mode selected.\n");
+        return -1;
+    }
 	if (argc == 3)
 		{
 		in = fopen(argv[1], "r");
@@ -224,22 +236,292 @@ int main(int argc,char **argv)
 		exit(1);
 		}
 
-	while (fgets(buf, sizeof(buf), in) != NULL)
-		{
+
+    if(acvp)  {
+        if ((json = read_file_as_json(argv[1])) == NULL)  {
+            fprintf(stderr, "Cannot open file: %s, %s\n", argc > 1 ? argv[1] : "(stdin)", strerror(errno));
+            goto error_die;
+        }
+        /* Data is parsed already; now we need to extract everything to give to the caller. */
+        /* Validate that the structure is sound and conforms with the expected structure format. */
+        if (cJSON_GetArraySize(json) != 2)  {
+            fprintf(stderr, "Expecting array of size 2 in top-level JSON. Check input format.\n");
+            goto error_die;
+        }
+
+        /* Check version is correct */
+        assert(verify_acvp_version(json, "1.0"));
+
+        /* Initialize output structure */
+        output = init_output (json);
+
+        /* Now get the pertinent details */
+        cJSON *vs = NULL;
+        SAFEGET(get_array_item(&vs, json, 1), "Vector set missing in JSON\n");
+        cJSON *algStr = NULL;
+        SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
+        cJSON *algModeStr = NULL;
+        SAFEGET(get_string_object(&algModeStr, vs, "mode"), "Algorithm mode identifier missing in JSON\n");
+
+        /* Get the DRBG handle */
+        nid = NID_undef;
+        if (!strcmp(algStr->valuestring, "ctrDRBG"))  {
+            drbg_type = DRBG_CTR;
+            if (!strcmp(algModeStr->valuestring, "AES-128"))
+                nid = NID_aes_128_ctr;
+            else if (!strcmp(algModeStr->valuestring, "AES-192"))
+                nid = NID_aes_192_ctr;
+            else if (!strcmp(algModeStr->valuestring, "AES-256"))
+                nid = NID_aes_256_ctr;
+        } else if (!strcmp(algStr->valuestring, "hashDRBG"))  {
+            drbg_type = DRBG_HASH;
+            if (!strcmp(algModeStr->valuestring, "SHA-1"))
+                nid = NID_sha1;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-224"))
+                nid = NID_sha224;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-256"))
+                nid = NID_sha256;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-384"))
+                nid = NID_sha256;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-512"))
+                nid = NID_sha512;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-512/224"))
+                nid = NID_undef;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-512/256"))
+                nid = NID_undef;
+        } else if (!strcmp(algStr->valuestring, "hmacDRBG"))  {
+            drbg_type = DRBG_HMAC;
+            if (!strcmp(algModeStr->valuestring, "SHA-1"))
+                nid = NID_hmacWithSHA1;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-224"))
+                nid = NID_hmacWithSHA224;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-256"))
+                nid = NID_hmacWithSHA256;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-384"))
+                nid = NID_hmacWithSHA384;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-512"))
+                nid = NID_hmacWithSHA512;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-512/224"))
+                nid = NID_undef;
+            else if (!strcmp(algModeStr->valuestring, "SHA2-512/256"))
+                nid = NID_undef;
+        }
+
+        if (nid == NID_undef || drbg_type == DRBG_NONE)  {
+            fprintf(stderr, "DRBG type %s (mode %s) not recognised!\n", algStr->valuestring, algModeStr->valuestring);
+            goto error_die;
+        }
+
+
+        /* For each test group
+         *      For each test case
+         *          Process...
+         */
+        cJSON *tgs = NULL;
+        SAFEGET(get_object(&tgs, vs, "testGroups"), "Missing 'testGroups' in input JSON\n");
+
+        /* Construct the (empty) response body */
+        cJSON *response = cJSON_CreateObject ();
+        cJSON *vsId = NULL;
+        SAFEGET (get_integer_object (&vsId, vs, "vsId"), "vsId missing in JSON\n");
+        SAFEPUT (put_integer ("vsId", vsId->valueint, response), "Unable to add vsId to output JSON\n");
+        cJSON *tgs_output = cJSON_CreateArray ();
+        SAFEPUT (put_object ("testGroups", tgs_output, response), "Unable to add testGroups to output JSON\n");
+
+        SAFEPUT (put_array_item (response, output), "Unable to add response body to JSON\n");
+
+        cJSON *tg = NULL;
+        cJSON_ArrayForEach(tg, tgs)  {
+            cJSON *tg_output = cJSON_CreateObject ();
+            /* Add to output */
+            SAFEPUT (put_array_item (tg_output, tgs_output), "Unable to append test group to output\n");
+
+            if(!tg)  {
+                fprintf(stderr, "Test groups array is missing test group object.\n");
+                goto error_die;
+            }
+
+            /* Get test group ID */
+            cJSON *tgId = NULL;
+            SAFEGET(get_integer_object(&tgId, tg, "tgId"), "Missing test group id!\n");
+
+            /* Copy tgId to output */
+            SAFEPUT (put_integer ("tgId", tgId->valueint, tg_output), "Unable to add tgId to test group %d\n", tgId->valueint);
+
+            cJSON *predictionResistence = NULL;
+            cJSON *reSeed = NULL;
+            cJSON *derFunc = NULL;  /* optional */
+            cJSON *entropyInputLen = NULL;
+            cJSON *nonceLen = NULL;
+            cJSON *persoStringLen = NULL;
+            cJSON *additionalInputLen = NULL;
+            cJSON *returnedBitsLen = NULL;
+
+            SAFEGET(get_boolean_object(&predictionResistence, tg, "predResistance"), "Unable to get predResistance in JSON in test group %d\n", tgId->valueint);
+            pr = cJSON_IsTrue(predictionResistence);
+
+            if (get_boolean_object(&derFunc, tg, "derFunc") < 0)  {
+                /* Optional; missing, no derivation function used. */
+                df = 0;
+            }
+            else
+                df = cJSON_IsTrue(derFunc);
+
+            SAFEGET(get_boolean_object(&reSeed, tg, "reSeed"), "Unable to get reSeed in JSON in test group %d\n", tgId->valueint);
+            SAFEGET(get_integer_object(&entropyInputLen, tg, "entropyInputLen"), "Unable to get entropyInputLen in JSON in test group %d\n", tgId->valueint);
+            SAFEGET(get_integer_object(&nonceLen, tg, "nonceLen"), "Unable to get nonceLen in JSON in test group %d\n", tgId->valueint);
+            SAFEGET(get_integer_object(&persoStringLen, tg, "persoStringLen"), "Unable to get persoStringLen in JSON in test group %d\n", tgId->valueint);
+            SAFEGET(get_integer_object(&additionalInputLen, tg, "additionalInputLen"), "Unable to get additionalInputLen in JSON in test group %d\n", tgId->valueint);
+            SAFEGET(get_integer_object(&returnedBitsLen, tg, "returnedBitsLen"), "Unable to get returnedBitsLen in JSON in test group %d\n", tgId->valueint);
+#if 0
+            /* I have no idea what the returnedBitsLen is for... */
+            randoutlen = returnedBitsLen->valueint/8;   /* In bytes */
+#endif
+
+            /* Now iterate over the test cases */
+            cJSON *tests = NULL;
+            SAFEGET(get_object(&tests, tg, "tests"), "Missing test cases in test group %d\n", tgId->valueint);
+
+            cJSON *tests_output = cJSON_CreateArray ();
+            SAFEPUT (put_object ("tests", tests_output, tg_output), "Unable to add tests array to output JSON for test group %d\n", tgId->valueint);
+
+            cJSON *tc = NULL;
+            cJSON_ArrayForEach(tc, tests)  {
+                cJSON *tc_output = cJSON_CreateObject ();
+                /* Add to output */
+                SAFEPUT (put_array_item (tc_output, tests_output), "Unable to append test case to test case array for group %d in JSON output\n", tgId->valueint);
+    
+                if(!tc)  {
+                    fprintf(stderr, "Test groups array is missing test cases.");
+                    goto error_die;
+                }
+
+                /* Get test case ID */
+                cJSON *tcId = NULL;
+                SAFEGET(get_integer_object(&tcId, tc, "tcId"), "Missing test case id in test group %d!\n", tgId->valueint);
+
+                /* Copy back to output */
+                SAFEPUT (put_integer ("tcId", tcId->valueint, tc_output), "Unable to provide tcId to test case %d in test group %d in JSON output\n", tcId->valueint, tgId->valueint);
+
+                cJSON *entropyInput = NULL;
+                cJSON *nonce_j = NULL;
+                cJSON *persoString = NULL;
+                cJSON *otherInputs = NULL;   /* Is an array of objects */
+
+                SAFEGET(get_string_object(&entropyInput, tc, "entropyInput"), "Unable to get entropyInput in JSON in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                SAFEGET(get_string_object(&nonce_j, tc, "nonce"), "Unable to get nonce in JSON in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                SAFEGET(get_string_object(&persoString, tc, "persoString"), "Unable to get persoString in JSON in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+                SAFEGET(get_object(&otherInputs, tc, "otherInput"), "Unable to get otherInput in JSON in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
+
+                long int dummy = 0;
+                t.ent = hex2bin_m(entropyInput->valuestring, &dummy);
+                t.entlen = entropyInputLen->valueint/8;
+                assert(dummy*8 == entropyInputLen->valueint);   /* I think this is invariant, but not sure */
+
+                t.nonce = hex2bin_m(nonce_j->valuestring, &dummy);
+                t.noncelen = nonceLen->valueint/8;
+                assert(dummy*8 == nonceLen->valueint);   /* I think this is invariant, but not sure */
+
+    			pers = hex2bin_m(persoString->valuestring, &dummy);
+                perslen = persoStringLen->valueint/8;
+                assert(dummy == perslen);    /* I think this is invariant, but not sure */
+
+
+    			dctx = FIPS_drbg_new(nid, df | DRBG_FLAG_TEST);
+	    		if (!dctx)  {
+                    fprintf(stderr, "Unable to construct FIPS DRBG instance\n");
+                    goto error_die;
+                }
+			    FIPS_drbg_set_callbacks(dctx, test_entropy, 0, 0, test_nonce, 0);
+    			FIPS_drbg_set_app_data(dctx, &t);
+	    		randoutlen = (int)FIPS_drbg_get_blocklength(dctx);
+		    	r = FIPS_drbg_instantiate(dctx, pers, perslen);
+			    if (!r)  {
+                    fprintf(stderr, "Error instantiating DRBG\n");
+                    goto error_die;
+                }
+	    		OPENSSL_free(pers);
+			    OPENSSL_free(t.ent);
+    			OPENSSL_free(t.nonce);
+	    		t.ent = t.nonce = pers = NULL;
+		    	gen = 0;
+
+                /* Process additional input */
+                cJSON *otherInput = NULL;
+                cJSON_ArrayForEach(otherInput, otherInputs)  {
+                    if(!otherInput)  {
+                        fprintf(stderr, "Test case %d in test group %d is missing otherInput\n", tcId->valueint, tgId->valueint);
+                        goto error_die;
+                    }
+
+                    /* There are two operations that can be done: reseed or generate. The array is designed to
+                     * be read in order and executed on. 
+                     */
+                    cJSON *intendedUse = NULL;
+                    cJSON *additionalInput = NULL;
+                    cJSON *entropyInput_gen = NULL;
+                    SAFEGET(get_string_object(&intendedUse, otherInput, "intendedUse"), "Unable to get intendedUse from otherInput\n");
+                    SAFEGET(get_string_object(&additionalInput, otherInput, "additionalInput"), "Unable to get additionalInput from otherInput\n");
+                    SAFEGET(get_string_object(&entropyInput_gen, otherInput, "entropyInput"), "Unable to get entropyInput from otherInput\n");
+
+			        adin = hex2bin_m(additionalInput->valuestring, &dummy);
+                    adinlen = additionalInputLen->valueint/8;
+                    assert(dummy*8 == additionalInputLen->valueint);
+
+                    if(t.ent) OPENSSL_free(t.ent); 
+                    t.ent = NULL;
+				    t.ent = hex2bin_m(entropyInput_gen->valuestring, &dummy);
+				    t.entlen = entropyInputLen->valueint/8;
+
+                    if(!strcmp(intendedUse->valuestring, "generate"))  {
+                        r = FIPS_drbg_generate(dctx, randout, randoutlen, pr, adin, adinlen);
+			            if (!r)  {
+				            fprintf(stderr, "Error generating DRBG bits\n");
+                            goto error_die;
+				        }
+                        gen++;
+                    }
+                    else if (!strcmp(intendedUse->valuestring, "reseed"))  {
+			            FIPS_drbg_reseed(dctx, adin, adinlen);
+                    }
+			        if(t.ent) OPENSSL_free(t.ent);
+			        t.ent = NULL;
+        			if (adin) OPENSSL_free(adin);
+	    		    adin = NULL;
+                }   /* End of otherInput array processing */
+
+                /* At this point, we had better have gen == 2, and then we can output */
+                assert(gen == 2);
+                unsigned char result_hex[sizeof(randout)*2+1];
+                SAFEPUT(put_string("returnedBits", bin2hex(randout, randoutlen, result_hex, sizeof(result_hex)), tc_output), "Unable to add returnedBits to output test case\n");
+	    		FIPS_drbg_free(dctx);
+		    	dctx = NULL;
+			    gen = 0;
+			}
+        }
+        printf ("%s\n", cJSON_Print (output));
+        ret = 0;
+        goto cleanup;
+    }
+
+    /* CAVS stream untouched */
+
+    while (fgets(buf, sizeof(buf), in) != NULL)
+        {
 		fputs(buf, out);
 		if (drbg_type == DRBG_NONE)
-			{
-			if (strstr(buf, "CTR_DRBG"))
-				drbg_type = DRBG_CTR;
-			else if (strstr(buf, "Hash_DRBG"))
-				drbg_type = DRBG_HASH;
-			else if (strstr(buf, "HMAC_DRBG"))
-				drbg_type = DRBG_HMAC;
-			else if (strstr(buf, "Dual_EC_DRBG"))
-				drbg_type = DRBG_DUAL_EC;
-			else
-				continue;
-			}
+		    {
+    		if (strstr(buf, "CTR_DRBG"))
+	        	drbg_type = DRBG_CTR;
+		   	else if (strstr(buf, "Hash_DRBG"))
+		    	drbg_type = DRBG_HASH;
+    		else if (strstr(buf, "HMAC_DRBG"))
+	    		drbg_type = DRBG_HMAC;
+		   	else if (strstr(buf, "Dual_EC_DRBG"))
+		    	drbg_type = DRBG_DUAL_EC;
+    		else
+	    		continue;
+		   	}
 		if (strlen(buf) > 4 && !strncmp(buf, "[SHA-", 5))
 			{
 			nid = dparse_md(buf);
@@ -406,11 +688,16 @@ int main(int argc,char **argv)
 			}
 
 		}
+    ret = 0;
+    goto cleanup;
+error_die:
+    ret = 1;
+cleanup:
 	if (in && in != stdin)
 		fclose(in);
 	if (out && out != stdout)
 		fclose(out);
-	return 0;
+	return ret;
 	}
 
 #endif
