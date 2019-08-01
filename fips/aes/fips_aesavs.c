@@ -1283,7 +1283,8 @@ int main(int argc, char **argv)  {
 	        strcpy(rfn, fn);
 	        if (VERBOSE)
     	    	printf("Processing: %s\n", rfn);
-	        if (proc_file_cavs(rfn, rspfile))  {
+	        if (   (cavs && proc_file_cavs(rfn, rspfile))
+                || (acvp && proc_file_acvp(rfn, rspfile)) )  {
         		printf(">>> Processing failed for: %s <<<\n", rfn);
 		        return 1;
     		}
