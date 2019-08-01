@@ -84,7 +84,7 @@ int main(int argc, char *argv[])
 
 static int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in);
 static int hmac_test_cavs(const EVP_MD *md, FILE *out, FILE *in);
-static int print_hmac(const EVP_MD *md, FILE *out,
+static int print_hmac(const EVP_MD *md, FILE *out, cJSON *node,
 		unsigned char *Key, int Klen,
 		unsigned char *Msg, int Msglen, int Tlen);
 
@@ -99,8 +99,7 @@ int main(int argc, char **argv)
 	int ret = 1, res = 0;
 	fips_algtest_init();
 
-    int acvp = 0, cavs = 0;
-    if(select_mode(&cavs, &acvp) != 0)  {
+    if(select_mode() != 0)  {
         printf("Unable to determine if CAVS or ACVP mode selected.\n");
         return -1;
     }
@@ -156,11 +155,12 @@ end:
 
 int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
 	unsigned char *Key = NULL, *Msg = NULL;
-	int Count, Klen, Tlen;
+	int Klen, Tlen;
 	long Keylen, Msglen;
 	int ret = 0;
 
     cJSON *json = NULL;
+    cJSON *output = NULL;
 
     if ((json = read_fd_as_json(in)) == NULL)  {
         printf("Cannot parse JSON file\n");
@@ -173,26 +173,50 @@ int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
         goto error_die;
     }
 
+    /* Initialize output structure */
+    output = init_output (json);
 
     /* Vector set */
-    const cJSON *vs = NULL;
+    cJSON *vs = NULL;
     SAFEGET(get_array_item(&vs, json, 1), "Vector set missing in JSON\n");
 
+    /* Construct the (empty) response body */
+    cJSON *response = cJSON_CreateObject ();
+    cJSON *vsId = NULL;
+    SAFEGET (get_integer_object (&vsId, vs, "vsId"), "vsId missing in JSON\n");
+    SAFEPUT (put_integer ("vsId", vsId->valueint, response), "Unable to add vsId to output JSON\n");
+    cJSON *tgs_output = cJSON_CreateArray ();
+    SAFEPUT (put_object ("testGroups", tgs_output, response), "Unable to add testGroups to output JSON\n");
+
+    SAFEPUT (put_array_item (response, output), "Unable to add response body to JSON\n");
+
     /* Need the algorithm function, the msg and the length */
-    const cJSON *algStr = NULL;
+    cJSON *algStr = NULL;
     SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
 
-    if(!strncmp("HMAC-SHA-1", algStr->valuestring, 8))   /* UNTESTED! */
+    /* Copy algorithm and revision to output */
+    /* TODO: Actually not clear if the algorithm and revision are needed since the server can marry those up based on vector set id.
+     * The spec says they are needed, but, for example, AES does not need it. 
+     */ 
+    SAFEPUT (put_string("algorithm", (const unsigned char *)algStr->valuestring, response), "Unable to add algorithm specifier to response body\n");
+    /* Get algorithm revision and copy to output */
+    cJSON *alg_rev = NULL;
+    SAFEGET(get_string_object(&alg_rev, vs, "revision"), "Revision identifier missing in JSON\n");
+    SAFEPUT (put_string("revision", (const unsigned char *)alg_rev->valuestring, response), "Unable to add algorithm revision to response body\n");
+
+
+    printf("algorithm %s\n", algStr->valuestring);
+    if(!strcmp("HMAC-SHA-1", algStr->valuestring))
         md=EVP_sha1();
-    else if(!strncmp("HMAC-SHA224", algStr->valuestring, 8))
+    else if(!strcmp("HMAC-SHA2-224", algStr->valuestring))
         md=EVP_sha224();
-    else if (!strncmp("HMAC-SHA256", algStr->valuestring, 8))
+    else if (!strcmp("HMAC-SHA2-256", algStr->valuestring))
         md=EVP_sha256();
-    else if (!strncmp("HMAC-SHA384", algStr->valuestring, 8))
+    else if (!strcmp("HMAC-SHA2-384", algStr->valuestring))
         md=EVP_sha384();
-    else if (!strncmp("HMAC-SHA512", algStr->valuestring, 8))
+    else if (!strcmp("HMAC-SHA2-512", algStr->valuestring))
         md=EVP_sha512();
-    /* TODO: Truncated versions? */
+    /* TODO: Truncated versions? Maybe already handled by macLen parameter in JSON */
     else {
         printf("Unknown message digest algorithm `%s'\n", algStr->valuestring);
         goto error_die;
@@ -203,50 +227,67 @@ int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
      *      For each test case
      *          Process...
      */
-    const cJSON *tgs = NULL;
+    cJSON *tgs = NULL;
     SAFEGET(get_object(&tgs, vs, "testGroups"), "Missing 'testGroups' in input JSON\n");
-    const cJSON *tg = NULL;
+    cJSON *tg = NULL;
     cJSON_ArrayForEach(tg, tgs)  {
+        cJSON *tg_output = cJSON_CreateObject ();
+        /* Add to output */
+        SAFEPUT (put_array_item (tg_output, tgs_output), "Unable to append test group to output\n");
+
         if(!tg)  {
             printf("Test groups array is missing test group object.\n");
             goto error_die;
         }
 
         /* Get test group ID */
-        const cJSON *tgId = NULL;
+        cJSON *tgId = NULL;
         SAFEGET(get_integer_object(&tgId, tg, "tgId"), "Missing test group id!\n");
+        /* Copy tgId to output */
+        SAFEPUT (put_integer ("tgId", tgId->valueint, tg_output), "Unable to add tgId to test group %d\n", tgId->valueint);
         /* Get test type */
-        const cJSON *test_type = NULL;
+        cJSON *test_type = NULL;
         SAFEGET(get_string_object(&test_type, tg, "testType"), "Missing `testType' in input JSON\n");
 
         /* Key length, message length, mac length */
-        const cJSON *keyLen = NULL;
+        cJSON *keyLen = NULL;
         SAFEGET(get_integer_object(&keyLen, tg, "keyLen"), "Missing `keyLen' in input JSON\n");
 
-        const cJSON *msgLen = NULL;
+        cJSON *msgLen = NULL;
         SAFEGET(get_integer_object(&msgLen, tg, "msgLen"), "Missing `msgLen' in input JSON\n");
 
-        const cJSON *macLen = NULL;
+        cJSON *macLen = NULL;
         SAFEGET(get_integer_object(&macLen, tg, "macLen"), "Missing `macLen' in input JSON\n");
 
         /* Now iterate over the test cases */
-        const cJSON *tests = NULL;
+        cJSON *tests = NULL;
         SAFEGET(get_object(&tests, tg, "tests"), "Missing test cases in test group %d\n", tgId->valueint);
 
-        const cJSON *tc = NULL;
+        /* Create test cases array */
+        cJSON *tests_output = cJSON_CreateArray ();
+        SAFEPUT (put_object ("tests", tests_output, tg_output), "Unable to add tests array to output JSON for test group %d\n", tgId->valueint);
+
+        cJSON *tc = NULL;
         cJSON_ArrayForEach(tc, tests)  {
+            cJSON *tc_output = cJSON_CreateObject ();
+            /* Add to output */
+            SAFEPUT (put_array_item (tc_output, tests_output), "Unable to append test case to test case array for group %d in JSON output\n", tgId->valueint);
+
             if(!tc)  {
                 printf("Test groups array is missing test cases.");
                 goto error_die;
             }
 
             /* Get test case ID */
-            const cJSON *tcId = NULL;
+            cJSON *tcId = NULL;
             SAFEGET(get_integer_object(&tcId, tc, "tcId"), "Missing test case id in test group %d!\n", tgId->valueint);
 
-            const cJSON *msgStr = NULL;
+            /* Copy back to output */
+            SAFEPUT (put_integer ("tcId", tcId->valueint, tc_output), "Unable to provide tcId to test case %d in test group %d in JSON output\n", tcId->valueint, tgId->valueint);
+
+            cJSON *msgStr = NULL;
             SAFEGET(get_string_object(&msgStr, tc, "msg"), "Missing message in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
-            const cJSON *keyStr = NULL;
+            cJSON *keyStr = NULL;
             SAFEGET(get_string_object(&keyStr, tc, "key"), "Missing key in test %d in test group %d\n", tcId->valueint, tgId->valueint);
 
             Msg = hex2bin_m(msgStr->valuestring, &Msglen);
@@ -257,7 +298,7 @@ int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
             Msglen = msgLen->valueint;
 
 		    if (Key && Msg && (Tlen > 0) && (Klen > 0))  {
-			    if (!print_hmac(md, out, Key, Klen, Msg, Msglen, Tlen))
+			    if (!print_hmac(md, NULL, tc_output, Key, Klen, Msg, Msglen, Tlen))
 				    goto error_die;
     			OPENSSL_free(Key);
 	    		Key = NULL;
@@ -269,6 +310,8 @@ int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
         }
     }
 
+    printf ("%s\n", cJSON_Print (output));
+
     ret = 1;
     goto cleanup;
 
@@ -277,7 +320,12 @@ error_die:
     ret = 0;
 
 cleanup:
-    if(json) cJSON_Delete(json); json = NULL;
+    if(json) 
+        cJSON_Delete(json); 
+    json = NULL;
+    if(output)
+        cJSON_Delete(output);
+    output = NULL;
 
     return ret;
 }
@@ -402,7 +450,7 @@ int hmac_test_cavs(const EVP_MD *md, FILE *out, FILE *in)
 
 		if (Key && Msg && (Tlen > 0) && (Klen > 0))
 			{
-			if (!print_hmac(md, out, Key, Klen, Msg, Msglen, Tlen))
+			if (!print_hmac(md, out, NULL, Key, Klen, Msg, Msglen, Tlen))
 				goto error;
 			OPENSSL_free(Key);
 			Key = NULL;
@@ -440,28 +488,43 @@ int hmac_test_cavs(const EVP_MD *md, FILE *out, FILE *in)
 
 	}
 
-static int print_hmac(const EVP_MD *emd, FILE *out,
+static int print_hmac(const EVP_MD *emd, FILE *out, cJSON *node,
 		unsigned char *Key, int Klen,
 		unsigned char *Msg, int Msglen, int Tlen)
 	{
 	int i, mdlen;
 	unsigned char md[EVP_MAX_MD_SIZE];
+    if((cavs && !out) || (acvp && !node))  {
+        fprintf(stderr, "Unable to construct output stream for %s format output\n", cavs ? "CAVS" : acvp ? "ACVP" : "UNKNOWN");
+        return 0;
+    }
+
 	if (!HMAC(emd, Key, Klen, Msg, Msglen, md,
 						(unsigned int *)&mdlen))
 		{
 		fputs("Error calculating HMAC\n", stderr);
 		return 0;
 		}
+    printf("Tlen = %d, mdlen = %d\n", Tlen, mdlen);
 	if (Tlen > mdlen)
 		{
 		fputs("Parameter error, Tlen > HMAC length\n", stderr);
 		return 0;
 		}
-	fputs("Mac = ", out);
-	for (i = 0; i < Tlen; i++)
-		fprintf(out, "%02x", md[i]);
-	fputs(RESP_EOL, out);
-	return 1;
+    if (cavs)  {
+    	fputs("Mac = ", out);
+	    for (i = 0; i < Tlen; i++)
+		    fprintf(out, "%02x", md[i]);
+    	fputs(RESP_EOL, out);
+    }
+    if(acvp)  {
+        unsigned char result_hex[EVP_MAX_MD_SIZE*2+1];
+        SAFEPUT(put_string("mac", bin2hex(md, Tlen, result_hex, sizeof(result_hex)), node), "Unable to allocate MAC output for JSON\n");
+    }
+    return 1;
+
+error_die:
+	return 0;
 	}
 
 #endif

@@ -653,6 +653,7 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
     unsigned char plaintext[2048];
     unsigned char ciphertext[2048];
     unsigned char result_hex[2048];
+    cJSON *output = NULL;
 
     EVP_CIPHER_CTX ctx;
     FIPS_cipher_ctx_init(&ctx);
@@ -698,7 +699,7 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
     assert(verify_acvp_version(json, "1.0"));
 
     /* Initialize output structure */
-    cJSON *output = init_output (json);
+    output = init_output (json);
 
     /* Now get the pertinent details */
     cJSON *vs = NULL;
@@ -912,6 +913,10 @@ cleanup:
     if(json) 
         cJSON_Delete(json); 
     json = NULL;
+    if(output)
+        cJSON_Delete(output);
+    output = NULL;
+
     FIPS_cipher_ctx_cleanup(&ctx);
 
     return ret;
