@@ -159,6 +159,7 @@ error_die:
 
 cJSON *init_output(cJSON *json)  {
     /* Take in the initial structure and copy the necessary pieces out */
+    cJSON *output = cJSON_CreateArray();
 
     /* Data is parsed already; now we need to extract everything to give to the caller. */
     /* Validate that the structure is sound and conforms with the expected structure format. */
@@ -177,7 +178,6 @@ cJSON *init_output(cJSON *json)  {
     cJSON *out_versionObj = cJSON_CreateObject();
     SAFEPUT(put_string("acvVersion", (const unsigned char *)versionStr->valuestring, out_versionObj), "Unable to add version string");
 
-    cJSON *output = cJSON_CreateArray();
     if (!output) return NULL;
     SAFEPUT(put_array_item(out_versionObj, output), "Unable to add version string to output structure");
 
