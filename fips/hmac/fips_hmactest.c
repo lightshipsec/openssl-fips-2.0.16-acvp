@@ -204,8 +204,6 @@ int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
     SAFEGET(get_string_object(&alg_rev, vs, "revision"), "Revision identifier missing in JSON\n");
     SAFEPUT (put_string("revision", (const unsigned char *)alg_rev->valuestring, response), "Unable to add algorithm revision to response body\n");
 
-
-    printf("algorithm %s\n", algStr->valuestring);
     if(!strcmp("HMAC-SHA-1", algStr->valuestring))
         md=EVP_sha1();
     else if(!strcmp("HMAC-SHA2-224", algStr->valuestring))
@@ -505,7 +503,6 @@ static int print_hmac(const EVP_MD *emd, FILE *out, cJSON *node,
 		fputs("Error calculating HMAC\n", stderr);
 		return 0;
 		}
-    printf("Tlen = %d, mdlen = %d\n", Tlen, mdlen);
 	if (Tlen > mdlen)
 		{
 		fputs("Parameter error, Tlen > HMAC length\n", stderr);

@@ -85,9 +85,9 @@ int main(int argc, char *argv[])
 
 static int dgst_test_cavs(FILE *out, FILE *in);
 static int dgst_test_acvp(FILE *out, FILE *in);
-static int print_dgst(const EVP_MD *md, FILE *out,
+static int print_dgst(const EVP_MD *md, FILE *out, cJSON *node,
 		unsigned char *Msg, int Msglen);
-static int print_monte(const EVP_MD *md, FILE *out,
+static int print_monte(const EVP_MD *md, FILE *out, cJSON *node,
 		unsigned char *Seed, int SeedLen);
 
 #ifdef FIPS_ALGVS
@@ -101,8 +101,7 @@ int main(int argc, char **argv)
 	int ret = 1;
 	fips_algtest_init();
 
-    int acvp = 0, cavs = 0;
-    if(select_mode(&cavs, &acvp) != 0)  {
+    if(select_mode() != 0)  {
         printf("Unable to determine if CAVS or ACVP mode selected.\n");
         return -1;
     }
@@ -165,6 +164,7 @@ int dgst_test_acvp(FILE *out, FILE *in)  {
 	long MsgLen = -1, Len = -1;
 	int ret = 0;
     cJSON *json = NULL;
+    cJSON *output = NULL;
 
     if ((json = read_fd_as_json(in)) == NULL)  {
         printf("Cannot parse JSON file\n");
@@ -177,24 +177,36 @@ int dgst_test_acvp(FILE *out, FILE *in)  {
         goto error_die;
     }
 
+    /* Initialize output structure */
+    output = init_output (json);
 
     /* Vector set */
-    const cJSON *vs = NULL;
+    cJSON *vs = NULL;
     SAFEGET(get_array_item(&vs, json, 1), "Vector set missing in JSON\n");
 
+    /* Construct the (empty) response body */
+    cJSON *response = cJSON_CreateObject ();
+    cJSON *vsId = NULL;
+    SAFEGET (get_integer_object (&vsId, vs, "vsId"), "vsId missing in JSON\n");
+    SAFEPUT (put_integer ("vsId", vsId->valueint, response), "Unable to add vsId to output JSON\n");
+    cJSON *tgs_output = cJSON_CreateArray ();
+    SAFEPUT (put_object ("testGroups", tgs_output, response), "Unable to add testGroups to output JSON\n");
+
+    SAFEPUT (put_array_item (response, output), "Unable to add response body to JSON\n");
+
     /* Need the algorithm function, the msg and the length */
-    const cJSON *algStr = NULL;
+    cJSON *algStr = NULL;
     SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
 
-    if(!strncmp("SHA-1", algStr->valuestring, 8))   /* UNTESTED! */
+    if(!strcmp("SHA-1", algStr->valuestring))   /* UNTESTED! */
         md=EVP_sha1();
-    else if(!strncmp("SHA2-224", algStr->valuestring, 8))
+    else if(!strcmp("SHA2-224", algStr->valuestring))
         md=EVP_sha224();
-    else if (!strncmp("SHA2-256", algStr->valuestring, 8))
+    else if (!strcmp("SHA2-256", algStr->valuestring))
         md=EVP_sha256();
-    else if (!strncmp("SHA2-384", algStr->valuestring, 8))
+    else if (!strcmp("SHA2-384", algStr->valuestring))
         md=EVP_sha384();
-    else if (!strncmp("SHA2-512", algStr->valuestring, 8))
+    else if (!strcmp("SHA2-512", algStr->valuestring))
         md=EVP_sha512();
     else {
         printf("Unknown message digest algorithm `%s'\n", algStr->valuestring);
@@ -206,40 +218,57 @@ int dgst_test_acvp(FILE *out, FILE *in)  {
      *      For each test case
      *          Process...
      */
-    const cJSON *tgs = NULL;
+    cJSON *tgs = NULL;
     SAFEGET(get_object(&tgs, vs, "testGroups"), "Missing 'testGroups' in input JSON\n");
-    const cJSON *tg = NULL;
+    cJSON *tg = NULL;
     cJSON_ArrayForEach(tg, tgs)  {
+        cJSON *tg_output = cJSON_CreateObject ();
+        /* Add to output */
+        SAFEPUT (put_array_item (tg_output, tgs_output), "Unable to append test group to output\n");
+
         if(!tg)  {
             printf("Test groups array is missing test group object.\n");
             goto error_die;
         }
 
         /* Get test group ID */
-        const cJSON *tgId = NULL;
+        cJSON *tgId = NULL;
         SAFEGET(get_integer_object(&tgId, tg, "tgId"), "Missing test group id!\n");
+        /* Copy tgId to output */
+        SAFEPUT (put_integer ("tgId", tgId->valueint, tg_output), "Unable to add tgId to test group %d\n", tgId->valueint);
         /* Get test type */
-        const cJSON *test_type = NULL;
+        cJSON *test_type = NULL;
         SAFEGET(get_string_object(&test_type, tg, "testType"), "Missing `testType' in input JSON\n");
 
         /* Now iterate over the test cases */
-        const cJSON *tests = NULL;
+        cJSON *tests = NULL;
         SAFEGET(get_object(&tests, tg, "tests"), "Missing test cases in test group %d\n", tgId->valueint);
 
-        const cJSON *tc = NULL;
+        /* Create test cases array */
+        cJSON *tests_output = cJSON_CreateArray ();
+        SAFEPUT (put_object ("tests", tests_output, tg_output), "Unable to add tests array to output JSON for test group %d\n", tgId->valueint);
+
+        cJSON *tc = NULL;
         cJSON_ArrayForEach(tc, tests)  {
+            cJSON *tc_output = cJSON_CreateObject ();
+            /* Add to output */
+            SAFEPUT (put_array_item (tc_output, tests_output), "Unable to append test case to test case array for group %d in JSON output\n", tgId->valueint);
+
             if(!tc)  {
                 printf("Test groups array is missing test cases.");
                 goto error_die;
             }
 
             /* Get test case ID */
-            const cJSON *tcId = NULL;
+            cJSON *tcId = NULL;
             SAFEGET(get_integer_object(&tcId, tc, "tcId"), "Missing test case id in test group %d!\n", tgId->valueint);
 
-            const cJSON *msgStr = NULL;
+            /* Copy back to output */
+            SAFEPUT (put_integer ("tcId", tcId->valueint, tc_output), "Unable to provide tcId to test case %d in test group %d in JSON output\n", tcId->valueint, tgId->valueint);
+
+            cJSON *msgStr = NULL;
             SAFEGET(get_string_object(&msgStr, tc, "msg"), "Missing message in test case %d in test group %d\n", tcId->valueint, tgId->valueint);
-            const cJSON *msgLen = NULL;
+            cJSON *msgLen = NULL;
             SAFEGET(get_integer_object(&msgLen, tc, "len"), "Missing message length in test %d in test group %d\n", tcId->valueint, tgId->valueint);
 
             Len = msgLen->valueint;
@@ -256,11 +285,14 @@ int dgst_test_acvp(FILE *out, FILE *in)  {
             Msg = hex2bin_m(msgStr->valuestring, &tmplen);
 
             if(!strncmp("AFT", test_type->valuestring, 3))  {
-    			if (!print_dgst(md, out, Msg, MsgLen))
+    			if (!print_dgst(md, NULL, tc_output, Msg, MsgLen))
 	    			goto error_die;
             }
             else if (!strncmp("MCT", test_type->valuestring, 3))  {
-			    if (!print_monte(md, out, Msg, MsgLen))
+                /* Add results array to structure */
+                cJSON *mct_results = cJSON_CreateArray ();
+                SAFEPUT(put_object ("resultsArray", mct_results, tc_output),  "Unable to allocate resultsArray for MCT in test group %d\n", tgId->valueint);
+			    if (!print_monte(md, NULL, mct_results, Msg, MsgLen))
 				    goto error_die;
             }
 			OPENSSL_free(Msg);
@@ -270,7 +302,9 @@ int dgst_test_acvp(FILE *out, FILE *in)  {
         }
     }
 
+    printf ("%s\n", cJSON_Print (output));
     ret = 1;
+
     goto cleanup;
 
 
@@ -278,8 +312,10 @@ error_die:
     ret = 0;
 
 cleanup:
-    if(json) cJSON_Delete(json); json = NULL;
-	if (Msg) OPENSSL_free(Msg); Msg = NULL;
+    if(json) cJSON_Delete(json); 
+    json = NULL;
+	if (Msg) OPENSSL_free(Msg); 
+    Msg = NULL;
 
     return ret;
 }
@@ -395,7 +431,7 @@ int dgst_test_cavs(FILE *out, FILE *in)
 
 		if (md && Msg && (MsgLen >= 0))
 			{
-			if (!print_dgst(md, out, Msg, MsgLen))
+			if (!print_dgst(md, out, NULL, Msg, MsgLen))
 				goto error;
 			OPENSSL_free(Msg);
 			Msg = NULL;
@@ -404,7 +440,7 @@ int dgst_test_cavs(FILE *out, FILE *in)
 			}
 		else if (md && Seed && (SeedLen > 0))
 			{
-			if (!print_monte(md, out, Seed, SeedLen))
+			if (!print_monte(md, out, NULL, Seed, SeedLen))
 				goto error;
 			OPENSSL_free(Seed);
 			Seed = NULL;
@@ -439,7 +475,7 @@ int dgst_test_cavs(FILE *out, FILE *in)
 
 	}
 
-static int print_dgst(const EVP_MD *emd, FILE *out,
+static int print_dgst(const EVP_MD *emd, FILE *out, cJSON *node,
 		unsigned char *Msg, int Msglen)
 	{
 	int i, mdlen;
@@ -449,14 +485,22 @@ static int print_dgst(const EVP_MD *emd, FILE *out,
 		fputs("Error calculating HASH\n", stderr);
 		return 0;
 		}
-	fputs("MD = ", out);
-	for (i = 0; i < mdlen; i++)
-		fprintf(out, "%02x", md[i]);
-	fputs(RESP_EOL, out);
-	return 1;
+    if(cavs)  {
+    	fputs("MD = ", out);
+	    for (i = 0; i < mdlen; i++)
+		    fprintf(out, "%02x", md[i]);
+    	fputs(RESP_EOL, out);
+    }
+    if(acvp)  {
+        unsigned char result_hex[mdlen*2+1];
+        SAFEPUT(put_string("md", bin2hex(md, mdlen, result_hex, sizeof(result_hex)), node), "Unable to allocate MD output for JSON\n");
+    }
+    return 1;
+error_die:
+	return 0;
 	}
 
-static int print_monte(const EVP_MD *md, FILE *out,
+static int print_monte(const EVP_MD *md, FILE *out, cJSON *node,
 		unsigned char *Seed, int SeedLen)
 	{
 	unsigned int i, j, k;
@@ -464,6 +508,11 @@ static int print_monte(const EVP_MD *md, FILE *out,
 	EVP_MD_CTX ctx;
 	unsigned char *m1, *m2, *m3, *p;
 	unsigned int mlen, m1len, m2len, m3len;
+
+    if((cavs && !out) || (acvp && !node))  {
+        fprintf(stderr, "Unable to construct output stream for %s format output\n", cavs ? "CAVS" : acvp ? "ACVP" : "UNKNOWN");
+        return 0;
+    }
 
 	FIPS_md_ctx_init(&ctx);
 
@@ -484,10 +533,15 @@ static int print_monte(const EVP_MD *md, FILE *out,
 	memcpy(m2, Seed, SeedLen);
 	memcpy(m3, Seed, SeedLen);
 
-	fputs(RESP_EOL, out);
+    if(cavs) fputs(RESP_EOL, out);
 
 	for (j = 0; j < 100; j++)
 		{
+        cJSON *mct_iter = cJSON_CreateObject ();
+        if (acvp)  {
+            /* Add to output, which is an array */
+            SAFEPUT(put_array_item (mct_iter, node), "Unable to allocate MCT iteration in output JSON node\n");
+        }
 		for (i = 0; i < 1000; i++)
 			{
 			FIPS_digestinit(&ctx, md);
@@ -502,11 +556,17 @@ static int print_monte(const EVP_MD *md, FILE *out,
 			m3 = p;
 			FIPS_digestfinal(&ctx, m3, &m3len);
 			}
-		fprintf(out, "COUNT = %d" RESP_EOL, j);
-		fputs("MD = ", out);
-		for (k = 0; k < m3len; k++)
-			fprintf(out, "%02x", m3[k]);
-		fputs(RESP_EOL RESP_EOL, out);
+        if(cavs)  {
+    		fprintf(out, "COUNT = %d" RESP_EOL, j);
+	    	fputs("MD = ", out);
+		    for (k = 0; k < m3len; k++)
+			    fprintf(out, "%02x", m3[k]);
+    		fputs(RESP_EOL RESP_EOL, out);
+        }
+        if(acvp)  {
+            unsigned char result_hex[m3len*2+1];
+            SAFEPUT(put_string("md", bin2hex(m3, m3len, result_hex, sizeof(result_hex)), mct_iter), "Unable to allocate MD output for JSON\n");
+        }
 		memcpy(m1, m3, m3len);
 		memcpy(m2, m3, m3len);
 		m1len = m2len = m3len;
@@ -514,6 +574,7 @@ static int print_monte(const EVP_MD *md, FILE *out,
 
 	ret = 1;
 
+    error_die:
 	mc_error:
 	if (m1)
 		OPENSSL_free(m1);
