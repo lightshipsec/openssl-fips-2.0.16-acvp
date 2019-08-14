@@ -900,7 +900,7 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
             dir,  /* 0 = decrypt, 1 = encrypt */
             plaintext, ciphertext, len);
 #endif
-    printf ("%s\n", cJSON_Print (output));
+    fprintf (rfp, "%s\n", cJSON_Print (output));
     goto cleanup;
 
 error_die:

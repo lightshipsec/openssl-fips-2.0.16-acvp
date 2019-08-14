@@ -308,7 +308,7 @@ int hmac_test_acvp(const EVP_MD *md, FILE *out, FILE *in)  {
         }
     }
 
-    printf ("%s\n", cJSON_Print (output));
+    fprintf (out, "%s\n", cJSON_Print (output));
 
     ret = 1;
     goto cleanup;

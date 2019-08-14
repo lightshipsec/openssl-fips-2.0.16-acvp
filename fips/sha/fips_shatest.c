@@ -302,7 +302,7 @@ int dgst_test_acvp(FILE *out, FILE *in)  {
         }
     }
 
-    printf ("%s\n", cJSON_Print (output));
+    fprintf (out, "%s\n", cJSON_Print (output));
     ret = 1;
 
     goto cleanup;

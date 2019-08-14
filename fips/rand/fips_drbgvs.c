@@ -499,7 +499,7 @@ int main(int argc,char **argv)
 			    gen = 0;
 			}
         }
-        printf ("%s\n", cJSON_Print (output));
+        fprintf (out, "%s\n", cJSON_Print (output));
         ret = 0;
         goto cleanup;
     }
