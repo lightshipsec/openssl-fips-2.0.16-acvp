@@ -16,3 +16,5 @@ ACVP=1 tests/fips_aesvs -f \<input\> \<output\>
 The reason for using environment variables is that we wanted to avoid modifying the
 OpenSSL test framework as much as possible.
 
+The code changes to use ACVP are completely encapsulated within the fips/* folder.
+For example, the AES ACVP code is found in fips/aes/fips_aesavs.c.
