@@ -279,7 +279,8 @@ cJSON *read_file_as_json(char *fn)  {
 
 unsigned char *bin2hex(unsigned char *bin, int bin_len, unsigned char *hex, int hex_len)  {
     if (!hex || (bin_len*2+1 > hex_len)) return NULL;
-    for(int i=0, j=0; i < bin_len; i++, j+=2)
+    int i, j;
+    for(i=0, j=0; i < bin_len; i++, j+=2)
        sprintf((char *)&hex[j], "%02X", bin[i]);
     hex[bin_len*2] = '\x0';
     return hex;
