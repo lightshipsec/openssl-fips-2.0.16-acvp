@@ -654,6 +654,7 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
     unsigned char ciphertext[2048];
     unsigned char result_hex[2048];
     cJSON *output = NULL;
+    char *amode_src_ptr = NULL;
 
     EVP_CIPHER_CTX ctx;
     FIPS_cipher_ctx_init(&ctx);
@@ -707,7 +708,12 @@ static int proc_file_acvp(char *rqfile, char *rspfile)  {
     cJSON *algStr = NULL;
     SAFEGET(get_string_object(&algStr, vs, "algorithm"), "Algorithm identifier missing in JSON\n");
     /* Algorithm mode is last chars after last hyphen. */
-    strcpy(amode, strrchr(algStr->valuestring, '-')+1);
+    if ((amode_src_ptr = strrchr(algStr->valuestring, '-')) == NULL)
+    {
+      printf("Invalid algorithm %s\n", algStr->valuestring);
+      goto error_die;
+    }
+    strcpy(amode, amode_src_ptr+1);
 
     /* For each test group
      *      For each test case

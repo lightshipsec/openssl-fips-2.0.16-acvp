@@ -271,6 +271,7 @@ success:
 cJSON *read_file_as_json(char *fn)  {
     if (!fn) return NULL;
     FILE *fd = fopen (fn, "rt");
+    if (!fd) return NULL;
     cJSON *json = read_fd_as_json(fd);
     fclose (fd);
     fd = NULL;
