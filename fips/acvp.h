@@ -3,6 +3,11 @@
 
 #include <cjson/cJSON.h>
 
+#include "fips_utl.h"
+
+
+#define SAFE_FUNC_FREE(p, func) if(p) { func(p); p = NULL; }
+
 /* Assumes caller has `error_die' guards set up.
  * If error is NULL, then we ignore the error.
  */
@@ -75,6 +80,49 @@ int get_boolean_object(cJSON **to, const cJSON *from, char *name) {
     *to = t;
     return 0;
 }
+int get_as_bytearray(unsigned char **to, int *to_len, const cJSON *from, char *name) {
+    if(!from || !name || !to || !to_len) return 1;
+    cJSON *t = cJSON_GetObjectItemCaseSensitive((cJSON *)from, name);
+    if(!t) return 1;
+    /* Convert from string to allocated byte array */
+    long bin_len = 0;
+    *to = hex2bin_m(t->valuestring, &bin_len);
+    if(*to) {
+        *to_len = bin_len;
+        return 0;
+    }
+    /* else error */
+    free(*to);
+    *to = NULL;
+    return 1;
+}
+
+unsigned char *reverse_bytearray(unsigned char *in, int in_len)  {
+    for (int i = 0, j = in_len-1; i < j; i++, j--)  {
+        unsigned char c = in[i];
+        in[i] = in[j];
+        in[j] = c;
+    }
+    return in;
+}
+
+unsigned char *bin2hex(unsigned char *bin, int bin_len, unsigned char *hex, int hex_len)  {
+    if (!hex || (bin_len*2+1 > hex_len)) return NULL;
+    for(int i=0, j=0; i < bin_len; i++, j+=2)
+       sprintf((char *)&hex[j], "%02X", bin[i]);
+    hex[bin_len*2] = '\x0';
+    return hex;
+}
+
+unsigned char *bin2hex_m(unsigned char *bin, int bin_len, unsigned char **hex)  {
+    if (!hex) return NULL;
+    unsigned char *hex_r = *hex;
+    hex_r = malloc(bin_len*2+1);
+    *hex = bin2hex(bin, bin_len, hex_r, bin_len*2+1);
+    return hex_r;
+}
+
+
 
 /* Appends; else use cJSON_InsertItemInArray to insert */
 int put_array_item(cJSON *obj, cJSON *to_arr)  {
@@ -142,7 +190,62 @@ int put_integer(const char *name, int value, cJSON *to) {
     if (value != verify->valueint) return -1;
     return 0;
 }
+int put_boolean(const char *name, cJSON_bool value, cJSON *to) { 
+    if(!to || !name) return -1;
+    cJSON *s = cJSON_CreateBool(value);
+    if(!s) return -1;
+    int before = 0, after = 0;
+    if (cJSON_IsArray(to))
+        before = cJSON_GetArraySize(to);
 
+    cJSON_AddItemToObject(to, name, s);
+    /* Unfortunately, the current cJSON API does not check if the addition was successful.
+     * Therefore, we check if the object is in there after adding.
+     */ 
+    cJSON *verify = NULL;
+    if (cJSON_IsObject(to))  {
+        int err = get_boolean_object(&verify, (const cJSON *)to, (char *)name);
+        if (err < 0 || !verify) return -1;
+    } else if (cJSON_IsArray(to))  {
+        after = cJSON_GetArraySize(to);
+        if (after != (before + 1)) return -1;
+        verify = cJSON_GetArrayItem(to, after-1);
+    }
+    if (cJSON_IsTrue(verify) && cJSON_IsFalse(s)) return -1;
+    if (cJSON_IsTrue(s) && cJSON_IsFalse(verify)) return -1;
+    return 0;
+}
+int put_bytearray(const char *name, unsigned char *value, int value_len, cJSON *to)  {
+    if(!name || !value || !value_len || !to) return 1;
+    char out[value_len*2+1];
+    if(!bin2hex(value, value_len, out, sizeof(out)))
+        return 1;
+    
+    if(put_string(name, out, to) != 0) return 1;
+    return 0;
+}   
+
+int ls_BN_bn2buf(const BIGNUM *b, unsigned char **y, size_t *y_len)  {
+    int rv;
+
+    if(!b) return 0; 
+    
+    *y_len = BN_num_bytes(b);
+    *y = OPENSSL_malloc(*y_len);
+    bzero(*y, *y_len);
+    if (BN_bn2bin(b, *y) <= 0)
+        goto err;
+    
+    rv = 1;
+
+err:
+    if(rv <= 0)  {
+        OPENSSL_free(*y);
+        *y = NULL;
+    }
+
+    return rv;
+}   
 
 int verify_acvp_version(cJSON *json, const char *check)  {
     /* Data is parsed already; now we need to extract everything to give to the caller. */
@@ -275,22 +378,6 @@ cJSON *read_file_as_json(char *fn)  {
     fclose (fd);
     fd = NULL;
     return json;
-}
-
-unsigned char *bin2hex(unsigned char *bin, int bin_len, unsigned char *hex, int hex_len)  {
-    if (!hex || (bin_len*2+1 > hex_len)) return NULL;
-    for(int i=0, j=0; i < bin_len; i++, j+=2)
-       sprintf((char *)&hex[j], "%02X", bin[i]);
-    hex[bin_len*2] = '\x0';
-    return hex;
-}
-
-unsigned char *bin2hex_m(unsigned char *bin, int bin_len, unsigned char **hex)  {
-    if (!hex) return NULL;
-    unsigned char *hex_r = *hex;
-    hex_r = malloc(bin_len*2+1);
-    *hex = bin2hex(bin, bin_len, hex_r, bin_len*2+1);
-    return hex_r;
 }
 
 
